@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { assembleBudgets, slimBudget, type BillPage, type BudgetApi, type Raw } from "./divvy-budgets.js";
+import { assembleBudgets, slimBudget, type BudgetApi, type Raw } from "./divvy-budgets.js";
+import { BILL_MAX_PAGE_SIZE, type BillPage } from "./divvy-paging.js";
 import { describeEmpty } from "./empty-listing.js";
 import { buildCursorList } from "./divvy-rows.js";
 import { buildEntityList } from "./qbo-rows.js";
@@ -198,6 +199,71 @@ test("every id a budget row states is an id divvy_list_transactions accepts", as
   // which is the whole point of being able to list budgets at all.
   assert.ok(FILTER_SPECS.budgetId.matches(tx, String(row.id)));
   assert.ok(FILTER_SPECS.budgetId.matches(tx, String(row.uuid)));
+});
+
+/**
+ * An endless BILL: every page is new rows and offers another cursor. What the
+ * assembler asks of it is then exactly each source's own bound — the thing
+ * issue #60 must not change when the local walker is replaced by the shared one.
+ */
+class EndlessBill implements BudgetApi {
+  readonly asked: Record<string, Array<{ page?: string; pageSize?: string }>> = {
+    budgets: [],
+    cards: [],
+    transactions: [],
+  };
+  private served = 0;
+
+  private page(list: string, p: { page?: string; pageSize?: string }): BillPage<Raw> {
+    this.asked[list].push({ page: p.page, pageSize: p.pageSize });
+    const n = Number(p.pageSize);
+    const results = Array.from({ length: n }, () => ({ id: `row${this.served++}` }));
+    return { results, nextPage: `${list}-${this.served}` };
+  }
+  async listBudgetsPage(p: { filters?: string; page?: string; pageSize?: string }) {
+    return this.page("budgets", p);
+  }
+  async getBudget(id: string): Promise<Raw> {
+    return { id, name: id };
+  }
+  async listCards(p: { page?: string; pageSize?: string } = {}) {
+    return this.page("cards", p);
+  }
+  async listTransactions(p: { page?: string; pageSize?: string } = {}) {
+    return this.page("transactions", p);
+  }
+}
+
+test("each source walks BILL through the shared walker, to exactly its own page bound", async () => {
+  const bill = new EndlessBill();
+  const result = await assembleBudgets(bill);
+  // The bounds the local walker had: cards 5, transactions 4, the budget list 10 per filter.
+  assert.equal(bill.asked.cards.length, 5);
+  assert.equal(bill.asked.transactions.length, 4);
+  assert.equal(bill.asked.budgets.length, 20);
+  // Every request asks for the endpoint's own page maximum and follows BILL's cursor.
+  assert.ok(bill.asked.cards.every((a) => a.pageSize === String(BILL_MAX_PAGE_SIZE.cards)));
+  assert.ok(bill.asked.transactions.every((a) => a.pageSize === String(BILL_MAX_PAGE_SIZE.transactions)));
+  assert.ok(bill.asked.budgets.every((a) => a.pageSize === String(BILL_MAX_PAGE_SIZE.budgets)));
+  assert.equal(bill.asked.cards[0].page, undefined);
+  assert.match(String(bill.asked.cards[1].page), /^cards-/);
+  const sources = result.sources as Record<string, string>;
+  assert.match(sources.cards, /500 card\(s\) scanned \(5 page\(s\)\)/);
+  assert.match(sources.transactions, /200 recent transaction\(s\) scanned \(4 page\(s\)/);
+  assert.match(sources["budget list"], /over 20 page\(s\)/);
+});
+
+test("a source whose cursor re-serves a page stops there, through the shared witness", async () => {
+  let cardCalls = 0;
+  const bill = new FakeBill({});
+  bill.listCards = async () => {
+    cardCalls += 1;
+    // The same page under a fresh cursor string every time.
+    return { results: [{ budgetId: "b1", budgetUuid: "bgt_1" }], nextPage: `fresh-${cardCalls}` };
+  };
+  const result = await assembleBudgets(bill);
+  assert.equal(cardCalls, 2, `walked ${cardCalls} card pages on a stuck cursor`);
+  assert.match((result.sources as Record<string, string>).cards, /1 card\(s\) scanned \(2 page\(s\)\)/);
 });
 
 test("a budget row keeps the name, the ids and this period's money, and drops the settings", () => {

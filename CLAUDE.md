@@ -57,7 +57,7 @@ gcloud config configurations activate mcp-billcom
 - `src/tools/divvy.ts` — Divvy/BILL Spend & Expense: list_transactions and list_cards (both flattened rows + cursor paging), get_transaction, upload_receipt, custom fields, members, budgets, list_pending_action
 - `src/divvy-filters.ts` — every filter `divvy_list_transactions` advertises, declared once as a pair: the term BILL is sent (`FILTER_SPECS[name].terms`) and the same question asked of a row that comes back (`.matches`). `FilterCheck` runs the second against every row of every BILL page walked, drops the rows that fail, and reports per filter how it was actually enforced — see "Filters" below
 - `src/divvy-paging.ts` — how BILL pages a list, declared once: the query parameters it actually reads (`nextPage`, `max` — never `page`/`page_size`), its own per-endpoint page maximum (transactions 50; cards, budgets, custom fields and custom-field values 100, each probed), `walkBillPages()`, which serves a caller's row count by walking BILL's cursor, and `DIVVY_LIST_TOOLS`/`UNPAGED_DIVVY_LISTS`, the table that requires every `divvy_list_*` tool to declare its paging or its reason for having none. Every paged BILL call goes through `DivvyClient.getBillPage`. It also holds the *witness* each knob is declared with — `PAGING_SPECS` (the query parameter it becomes, and the question asked of the page that comes back) and `PagingCheck`, which every walk runs so a cursor that does not advance stops the walk instead of looping — see "Page size", "Every listing declares its paging" and "A paging knob is witnessed, not assumed" below
-- `src/divvy-budgets.ts` — the assembled budget listing (`assembleBudgets`, `slimBudget`). BILL's `/v3/spend/budgets` does not return every budget on these books, so the listing is built from the sources that do name one — see "Budgets" below
+- `src/divvy-budgets.ts` — the assembled budget listing (`assembleBudgets`, `slimBudget`); its sources page through `walkBillPages` like every other BILL walk. BILL's `/v3/spend/budgets` does not return every budget on these books, so the listing is built from the sources that do name one — see "Budgets" below
 - `src/empty-listing.ts` — `describeEmpty()`, the `empty` block a zero-row listing carries. Attached by `buildEntityList` / `buildCursorList` for **every** list tool, so a bare `[]` cannot pose as "there are none" — see "Empty listings" below
 - `src/divvy-rows.ts` — the flattened Divvy rows (`slimTransaction`, `slimCard`, `slimCustomField`) plus `buildCursorList()`, the cursor-paged twin of `buildEntityList()`: same `returned`/`pageTotal`/`hasMore`/`truncatedBy`/`note` vocabulary, but the position is BILL's opaque `nextPage`, and `truncatedBy` has a third value (`cursor`) for the cursor that did not advance. No `rowCount` — BILL's list returns no total, and an omitted count beats an invented one. It carries the `paging` block the same way it carries `filtering`
 - `src/protocol-version.ts` — legacy-era protocol-version negotiation + header reconciliation (see "Protocol version" below)
@@ -553,6 +553,24 @@ definitions (315 chars), 6 transactions for 2026-05-01..2026-06-30 (2,613
 chars), `divvy_list_pending_action` 1 pending / 0 to review (448 chars), and the
 assembled budget listing 15 budgets over its 7 walked pages (3,161 chars) — the
 walkers that had the `next === cursor` hole, still walking.
+
+### Where a cursor may be followed
+
+`walkBillPages` is the only place a BILL cursor is followed. The budget
+assembler and `listPendingAction` each had a hand-rolled loop, and #33's
+witness reached them only because someone pasted it into each (issue #60) — the
+rule lived in `src/divvy-paging.ts` and the loops lived elsewhere. Both now call
+`walkBillPages`, which takes `maxPages` for a walk that needs its own bound
+(the budget sources' 5/4/10 pages, the pending-action triage's 50), and
+`divvy-budgets.ts` no longer declares its own `BillPage`.
+
+`src/divvy-walkers.test.ts` pins it: it asks the TypeScript checker what every
+`nextPage` read in a non-test source resolves to, and outside
+`divvy-paging.ts` only `Walked.nextPage` (the cursor the walker hands back) and
+`CursorListInput.nextPage` (the one a result builder hands on) are allowed. A
+read of `BillPage.nextPage`, a `nextPage` on a type cast in place, or a
+`new PagingCheck` fails by file and line. Run against the two old walkers it
+names all four lines.
 
 ## Budgets
 
