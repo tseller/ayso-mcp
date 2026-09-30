@@ -149,14 +149,14 @@ test("the loop, reproduced: a cursor that re-serves its own page stops the walk 
   const { handler } = registeredTools(client).get("divvy_list_custom_field_values")!;
 
   const first = await call(handler, { customFieldId: "tty_nap", pageSize: 3 });
-  assert.equal((first.results as unknown[]).length, 3);
+  assert.equal((first.values as unknown[]).length, 3);
   const cursor = first.nextPage as string;
   assert.ok(cursor, "the first page hands back a cursor");
 
   const second = await call(handler, { customFieldId: "tty_nap", page: cursor, pageSize: 3 });
   // The rows are ones the caller already holds. Handing them back as a new page
   // IS the loop, so they are dropped and the reason is stated.
-  assert.deepEqual(second.results, []);
+  assert.deepEqual(second.values, []);
   assert.equal(second.nextPage, undefined, "no cursor to follow forever");
   assert.equal(second.truncatedBy, "cursor");
   const verdict = String((second.paging as Record<string, string>).page);
@@ -239,7 +239,7 @@ test("walking a custom field's values reaches the end, visiting each value exact
   for (;;) {
     const result = await call(handler, { customFieldId: "tty_nap", pageSize: 10, page: cursor });
     calls += 1;
-    for (const row of result.results as Array<{ uuid: string }>) seen.push(row.uuid);
+    for (const row of result.values as Array<{ uuid: string }>) seen.push(row.uuid);
     cursor = result.nextPage as string | undefined;
     assert.ok(calls <= 12, "the walk did not terminate");
     if (!cursor) break;
@@ -256,7 +256,7 @@ test("the whole list in one call is the default, at BILL's own page maximum", as
   const client = valuesClient(72);
   const { handler } = registeredTools(client).get("divvy_list_custom_field_values")!;
   const result = await call(handler, { customFieldId: "tty_nap" });
-  assert.equal((result.results as unknown[]).length, 72);
+  assert.equal((result.values as unknown[]).length, 72);
   assert.equal(result.nextPage, undefined, "the list ended");
   assert.deepEqual(client.asked, [
     { page: undefined, pageSize: String(BILL_MAX_PAGE_SIZE.customFieldValues) },

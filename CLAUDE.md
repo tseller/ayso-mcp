@@ -59,7 +59,7 @@ gcloud config configurations activate mcp-billcom
 - `src/divvy-paging.ts` — how BILL pages a list, declared once: the query parameters it actually reads (`nextPage`, `max` — never `page`/`page_size`), its own per-endpoint page maximum (transactions 50; cards, budgets, custom fields and custom-field values 100, each probed), `walkBillPages()`, which serves a caller's row count by walking BILL's cursor, and `DIVVY_LIST_TOOLS`/`UNPAGED_DIVVY_LISTS`, the table that requires every `divvy_list_*` tool to declare its paging or its reason for having none. Every paged BILL call goes through `DivvyClient.getBillPage`. It also holds the *witness* each knob is declared with — `PAGING_SPECS` (the query parameter it becomes, and the question asked of the page that comes back) and `PagingCheck`, which every walk runs so a cursor that does not advance stops the walk instead of looping — see "Page size", "Every listing declares its paging" and "A paging knob is witnessed, not assumed" below
 - `src/divvy-budgets.ts` — the assembled budget listing (`assembleBudgets`, `slimBudget`). BILL's `/v3/spend/budgets` does not return every budget on these books, so the listing is built from the sources that do name one — see "Budgets" below
 - `src/empty-listing.ts` — `describeEmpty()`, the `empty` block a zero-row listing carries. Attached by `buildEntityList` / `buildCursorList` for **every** list tool, so a bare `[]` cannot pose as "there are none" — see "Empty listings" below
-- `src/divvy-rows.ts` — the flattened Divvy rows (`slimTransaction`, `slimCard`, `slimCustomField`) plus `buildCursorList()`, the cursor-paged twin of `buildEntityList()`: same `returned`/`pageTotal`/`hasMore`/`truncatedBy`/`note` vocabulary, but the position is BILL's opaque `nextPage`, and `truncatedBy` has a third value (`cursor`) for the cursor that did not advance. No `rowCount` — BILL's list returns no total, and an omitted count beats an invented one. It carries the `paging` block the same way it carries `filtering`
+- `src/divvy-rows.ts` — the flattened Divvy rows (`slimTransaction`, `slimCard`, `slimCustomField`, `slimCustomFieldValue`) plus `buildCursorList()`, the cursor-paged twin of `buildEntityList()`: same `returned`/`pageTotal`/`hasMore`/`truncatedBy`/`note` vocabulary, but the position is BILL's opaque `nextPage`, and `truncatedBy` has a third value (`cursor`) for the cursor that did not advance. No `rowCount` — BILL's list returns no total, and an omitted count beats an invented one. It carries the `paging` block the same way it carries `filtering`
 - `src/protocol-version.ts` — legacy-era protocol-version negotiation + header reconciliation (see "Protocol version" below)
 - `src/era-routing.ts` — which leg of `/mcp` serves a request: the SDK's `classifyInboundRequest`, plus the one rule that goes in front of it (an `Mcp-Session-Id` means legacy, always). See "Protocol eras" below
 - `src/discover.ts` — what the modern leg advertises, read by **asking** the modern leg rather than restating it beside it. No protocol revision is hard-coded in this repo; a test greps for one
@@ -425,12 +425,24 @@ are empty on every field here) and keeps **both** ids, because
 are driven from the uuid. There is no `pageTotal`: a field definition carries
 no amount.
 
-What the pin does **not** yet cover is that result shape.
-`divvy_list_custom_field_values` satisfies the test — it is declared, and it
-really pages — while still handing BILL's envelope back, so a page past the end
-of the NAP codes is a bare `{"results":[]}` with no `empty` block. That is
-issue #55: the pin checks the input vocabulary, and the same widening is owed
-to the output.
+The pin covers the **result** shape too (#55). It first checked only the input
+vocabulary, and `divvy_list_custom_field_values` passed it — declared, and
+really paging — while still handing BILL's envelope back, so a page past the
+end of the NAP codes was a bare `{"results":[]}` with no `empty` block. A second
+test now drives every tool in `DIVVY_LIST_TOOLS` against a BILL that returns no
+rows (a stub answering an empty page to any method, so a new listing needs no
+stub of its own) and requires `returned: 0`, `hasMore: false` and an `empty`
+block, and no raw `results`. Against the old tool it fails by name:
+`` `divvy_list_custom_field_values` is declared a paged BILL list but does not
+state `returned` ``.
+
+The values list now goes through `buildCursorList` as `CustomFieldValue` rows
+under `values` (`slimCustomFieldValue`: both ids and the label; `deleted` only
+when true; no `pageTotal`). Its witness is the `selectedValues` recent
+transactions carry on **that** field. A field no recent transaction carries
+yields no witness at all, so its empty answer is `unverified` rather than a
+`none-found` built on a check that never saw the field — the tool is asked by
+id, and a transaction's field block may spell it differently.
 
 Live books, measured on revision `billcom-mcp-00072-lpt`.
 `divvy_list_custom_fields {}` returns both definitions (NAP CODES, Notes) in one

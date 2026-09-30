@@ -1,6 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildCursorList, slimCard, slimCustomField, slimTransaction } from "./divvy-rows.js";
+import {
+  buildCursorList,
+  slimCard,
+  slimCustomField,
+  slimCustomFieldValue,
+  slimTransaction,
+} from "./divvy-rows.js";
 import { FILTER_SPECS, FilterCheck, billFilterParam } from "./divvy-filters.js";
 import { DivvyClient } from "./divvy-client.js";
 import { registerDivvyTools } from "./tools/divvy.js";
@@ -692,7 +698,7 @@ test("the custom-field values list pages — and its pageSize is bounded too", a
 
   assert.deepEqual(asked, [{ page: "cursor-2", pageSize: "1" }]);
   assert.equal(openCursor(String(result.nextPage)).cursor, "next-cursor");
-  assert.equal((result.results as unknown[]).length, 1);
+  assert.equal((result.values as unknown[]).length, 1);
 
   const limits = billPagingLimits("customFieldValues");
   const pageSize = schema.pageSize as { safeParse(v: unknown): { success: boolean } };
@@ -897,6 +903,154 @@ test("every Divvy listing declares its paging, or declares why it has none", () 
   for (const name of [...Object.keys(DIVVY_LIST_TOOLS), ...Object.keys(UNPAGED_DIVVY_LISTS)]) {
     assert.ok(listings.includes(name), `\`${name}\` is declared but no tool registers it`);
   }
+});
+
+/**
+ * The pin's other half (issue #55). The test above checks what a paged listing
+ * ACCEPTS; this checks what it RETURNS. `divvy_list_custom_field_values`
+ * satisfied the input pin — declared, and genuinely paging — while still
+ * handing BILL's envelope back, so a page past the end was a bare
+ * `{"results":[]}` that could not say which kind of nothing it was. That is the
+ * silence that hid a blind budget endpoint (#34), and nothing stopped the next
+ * listing from shipping it.
+ *
+ * So every declared paged listing is driven against a BILL that returns no
+ * rows at all, and must answer in the shared result vocabulary: `returned`,
+ * `hasMore`, and an `empty` block — never BILL's own `results` array.
+ */
+test("every paged Divvy listing answers zero rows in the shared result vocabulary", async () => {
+  // Every BILL method answers an empty page, whichever the tool calls — so a
+  // listing added tomorrow needs no stub written for it to be checked here.
+  const emptyBill = new Proxy(
+    {},
+    { get: () => async () => ({ results: [], nextPage: undefined }) },
+  );
+  const tools = registeredTools(emptyBill);
+
+  for (const name of Object.keys(DIVVY_LIST_TOOLS)) {
+    const { schema, handler } = tools.get(name)!;
+    // Fill whatever the tool requires (a field id, say) with a placeholder.
+    const args: Record<string, unknown> = {};
+    for (const [key, field] of Object.entries(schema)) {
+      const f = field as { safeParse(v: unknown): { success: boolean } };
+      if (!f.safeParse(undefined).success) args[key] = "x";
+    }
+    const res = await handler(args);
+    assert.notEqual(res.isError, true, `\`${name}\` errored on an empty page: ${res.content[0].text}`);
+    const result = JSON.parse(res.content[0].text) as Record<string, unknown>;
+
+    assert.equal(
+      result.returned,
+      0,
+      `\`${name}\` is declared a paged BILL list but does not state \`returned\` — ` +
+        `it hands BILL's envelope back instead of the shared result vocabulary (#55)`,
+    );
+    assert.equal(result.hasMore, false, `\`${name}\` states no \`hasMore\` on an empty last page`);
+    const empty = result.empty as { meaning?: string } | undefined;
+    assert.ok(
+      empty?.meaning,
+      `\`${name}\` returned zero rows with no \`empty\` block, so "none exist" and ` +
+        `"this source could not see them" read the same (#34, #55)`,
+    );
+    assert.equal(result.results, undefined, `\`${name}\` still carries BILL's raw \`results\``);
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * Custom field values (issue #55): paged, and now speaking the shared
+ * result vocabulary.
+ * ------------------------------------------------------------------ */
+
+/** A transaction whose NAP CODES field names these values, spelled as BILL does. */
+const txSelecting = (fieldId: string, labels: string[]) => ({
+  ...liveTransaction(1),
+  customFields: [
+    {
+      uuid: fieldId,
+      customFieldId: fieldId,
+      name: "NAP CODES",
+      type: "SELECT",
+      selectedValues: labels.map((l) => ({ value: l, label: l })),
+    },
+  ],
+});
+
+test("a custom-field value row keeps both ids and the label, and omits deleted: false", () => {
+  assert.deepEqual(
+    slimCustomFieldValue({
+      id: "VGFnVmFsdWU6MzAwNTAw",
+      uuid: "tvl_p5ag95f6p95gv5dhtl8a53ie",
+      value: "Bank and Credit Card Fees ",
+      deleted: false,
+    }),
+    { id: "VGFnVmFsdWU6MzAwNTAw", uuid: "tvl_p5ag95f6p95gv5dhtl8a53ie", value: "Bank and Credit Card Fees" },
+  );
+  assert.equal(slimCustomFieldValue({ id: "a", uuid: "b", value: "Old", deleted: true }).deleted, true);
+});
+
+test("a page of values speaks returned / hasMore / nextPage like every other listing", async () => {
+  const client = {
+    listCustomFieldValues: async () => ({
+      results: [{ id: "v1", uuid: "tvl_1", value: "NAP-100", deleted: false }],
+      nextPage: "next-cursor",
+    }),
+  };
+  const { handler } = registeredTools(client).get("divvy_list_custom_field_values")!;
+  const result = await listResult(handler, { customFieldId: "tty_nap", pageSize: 1 });
+
+  assert.equal(result.entity, "CustomFieldValue");
+  assert.equal(result.returned, 1);
+  assert.equal(result.hasMore, true);
+  assert.equal(result.truncatedBy, "window");
+  assert.equal(openCursor(String(result.nextPage)).cursor, "next-cursor");
+  // A value carries no amount, so there is no pageTotal to invent.
+  assert.equal(result.pageTotal, undefined);
+  assert.deepEqual(result.values, [{ id: "v1", uuid: "tvl_1", value: "NAP-100" }]);
+});
+
+test("an empty values listing while transactions select values on that field is source-blind", async () => {
+  const client = {
+    listCustomFieldValues: async () => ({ results: [], nextPage: undefined }),
+    listTransactions: async () => ({
+      results: [txSelecting("tty_nap", ["NAP-101"]), txSelecting("tty_nap", ["NAP-102", "NAP-101"])],
+      nextPage: undefined,
+    }),
+  };
+  const { handler } = registeredTools(client).get("divvy_list_custom_field_values")!;
+  const result = await listResult(handler, { customFieldId: "tty_nap" });
+  const empty = result.empty as { meaning: string; checked: unknown[] };
+
+  assert.equal(result.returned, 0);
+  assert.equal(empty.meaning, "source-blind");
+  assert.deepEqual(empty.checked, [
+    { source: "recent transactions", found: 2, sample: ["NAP-101", "NAP-102"] },
+  ]);
+});
+
+test("values selected on a DIFFERENT field are no witness for this one", async () => {
+  const client = {
+    listCustomFieldValues: async () => ({ results: [], nextPage: undefined }),
+    listTransactions: async () => ({
+      results: [txSelecting("tty_nap", []), txSelecting("tty_other", ["Z-9"])],
+      nextPage: undefined,
+    }),
+  };
+  const { handler } = registeredTools(client).get("divvy_list_custom_field_values")!;
+  const result = await listResult(handler, { customFieldId: "tty_nap" });
+  // The field was sighted and nothing was selected on it: a checked nothing.
+  assert.equal((result.empty as { meaning: string }).meaning, "none-found");
+});
+
+test("a field no recent transaction carries is unverified, not none-found", async () => {
+  // Asked by an id the transactions do not spell — the witness never saw the
+  // field, so `found: 0` would claim a check that did not happen.
+  const client = {
+    listCustomFieldValues: async () => ({ results: [], nextPage: undefined }),
+    listTransactions: async () => ({ results: [txSelecting("tty_other", ["Z-9"])], nextPage: undefined }),
+  };
+  const { handler } = registeredTools(client).get("divvy_list_custom_field_values")!;
+  const result = await listResult(handler, { customFieldId: "tty_nap" });
+  assert.equal((result.empty as { meaning: string }).meaning, "unverified");
 });
 
 test("with no filters set, nothing is sent to BILL and nothing is claimed", async () => {
