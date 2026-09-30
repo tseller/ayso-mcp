@@ -40,13 +40,7 @@ export function slimTransaction(tx: Tx): Record<string, unknown> {
   const fields: Record<string, string> = {};
   for (const f of customFields) {
     if (!f.name) continue;
-    const selected = (f.selectedValues ?? [])
-      .map((v) => {
-        if (typeof v === "string") return v;
-        const o = v as { value?: unknown; label?: unknown; name?: unknown };
-        return String(o.value ?? o.label ?? o.name ?? "");
-      })
-      .filter(Boolean);
+    const selected = selectedValueLabels(f);
     const value = selected.length > 0 ? selected.join(", ") : (f.note ?? "").trim();
     if (value) fields[f.name] = value;
   }
@@ -64,6 +58,42 @@ export function slimTransaction(tx: Tx): Record<string, unknown> {
     // tool advertises as carrying a sync status never carried one.
     syncStatus: rowSyncStatus(tx),
     ...(Object.keys(fields).length > 0 ? { fields } : {}),
+  };
+}
+
+/**
+ * The labels of the values selected on one of a transaction's custom fields.
+ * BILL has sent these both as bare strings and as `{value, label}` objects, so
+ * both are read. Shared by the transaction row and by the witness for
+ * `divvy_list_custom_field_values`, so the two cannot read a value differently.
+ */
+export function selectedValueLabels(field: { selectedValues?: unknown }): string[] {
+  const selected = Array.isArray(field.selectedValues) ? field.selectedValues : [];
+  return selected
+    .map((v) => {
+      if (typeof v === "string") return v;
+      const o = (v ?? {}) as { value?: unknown; label?: unknown; name?: unknown };
+      return String(o.value ?? o.label ?? o.name ?? "");
+    })
+    .filter(Boolean);
+}
+
+/**
+ * One option value of a custom field (a NAP code) as a row.
+ *
+ * BILL's value object is already small — both ids, the label, a `deleted` flag
+ * — so the row is mostly the object itself; what it changes is that `deleted`
+ * is carried only when it is true, the same rule the card and field rows follow
+ * for a column that is `false` on every row. Both ids stay: the `uuid` is what
+ * `divvy_update_transaction_custom_fields` takes in `selectedValues`.
+ */
+export function slimCustomFieldValue(value: Tx): Record<string, unknown> {
+  const label = typeof value.value === "string" ? value.value.trim() : value.value;
+  return {
+    id: value.id,
+    uuid: value.uuid,
+    value: label,
+    ...(value.deleted ? { deleted: true } : {}),
   };
 }
 

@@ -3,7 +3,14 @@ import { z } from 'zod';
 import { DivvyClient } from '../divvy-client.js';
 import { runTool } from '../tool-logging.js';
 import { sniffContentType } from '../mime.js';
-import { buildCursorList, slimCard, slimCustomField, slimTransaction } from '../divvy-rows.js';
+import {
+  buildCursorList,
+  selectedValueLabels,
+  slimCard,
+  slimCustomField,
+  slimCustomFieldValue,
+  slimTransaction,
+} from '../divvy-rows.js';
 import { FilterCheck } from '../divvy-filters.js';
 import type { Witness } from '../empty-listing.js';
 import { assembleBudgets } from '../divvy-budgets.js';
@@ -81,6 +88,35 @@ const customFieldsNamedByTransactions = (client: DivvyClient) =>
       .map((f) => (typeof f.name === 'string' ? f.name.trim() : ''))
       .filter(Boolean);
   });
+
+/**
+ * The values recent transactions have selected on ONE field — the witness for
+ * `divvy_list_custom_field_values`. A transaction carries each field's
+ * `selectedValues`, so a NAP code filled on a recent purchase is a sighting of
+ * a value the values endpoint should have returned.
+ *
+ * Unlike the other witnesses this one can fail to find the field at all: the
+ * tool is asked by id, and a transaction's field block may spell that id
+ * differently (`uuid`, `customFieldId`, `id`). A field no recent transaction
+ * carries has not been checked, so it yields no witness — and the `empty`
+ * block says `unverified` — rather than `found: 0` posing as `none-found`.
+ */
+const valuesNamedByTransactions = async (
+  client: DivvyClient,
+  customFieldId: string,
+): Promise<Witness[]> => {
+  let sighted = false;
+  const witnesses = await namedByRecentTransactions(client, (tx) => {
+    const fields = Array.isArray(tx.customFields) ? tx.customFields : [];
+    return (fields as Array<Record<string, unknown>>)
+      .filter((f) => [f.uuid, f.customFieldId, f.id].includes(customFieldId))
+      .flatMap((f) => {
+        sighted = true;
+        return selectedValueLabels(f);
+      });
+  });
+  return sighted ? witnesses : [];
+};
 
 export function registerDivvyTools(server: McpServer, client: DivvyClient): void {
   server.registerTool(
@@ -303,8 +339,10 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
   server.registerTool(
     'divvy_list_custom_field_values',
     {
-      description: 'List the available option values for a Divvy custom field (e.g. the list of NAP codes). Returns each value\'s ID and label. ' +
-      `Paged: \`pageSize\` is rows (default ${BILL_MAX_PAGE_SIZE.customFieldValues}, BILL's own page maximum), and when \`nextPage\` comes back, call again with \`page: nextPage\`.`,
+      description: 'List the available option values for a Divvy custom field (e.g. the list of NAP codes). ' +
+      'Returns one row per value — both ids (`uuid` is what `divvy_update_transaction_custom_fields` takes in `selectedValues`) and the label. ' +
+      `Paged: \`pageSize\` is rows (default ${BILL_MAX_PAGE_SIZE.customFieldValues}, BILL's own page maximum), and when \`hasMore\` is true, call again with \`page: nextPage\`. ` +
+      'A listing that returns nothing says which kind of nothing it found (`empty`), checked against the values recent transactions selected on this field.',
       inputSchema: z.object({
       customFieldId: z.string().describe('Custom field ID from divvy_list_custom_fields'),
       ...cursorPaging(billPagingLimits('customFieldValues'), { format: false }),
@@ -326,20 +364,27 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
             pageSizeAsked: pageSize === undefined ? undefined : String(pageSize),
             page,
             fetch: (p) => client.listCustomFieldValues(customFieldId, p),
-            measure: (v) => compact(v).length,
+            measure: (v) => compact(slimCustomFieldValue(v)).length,
             budgetChars: rowBudget(),
           });
-          // This one still hands BILL's envelope back (issue #55 owns widening
-          // it to the shared `returned`/`hasMore`/`empty` vocabulary), so the
-          // paging verdict rides beside it: a cursor that did not advance must
-          // be visible here of all places, since this is the tool it looped on.
-          return {
-            ...walked.last,
-            results: walked.rows,
+          // It handed BILL's envelope back until issue #55, so a page past the
+          // end was a bare `{"results":[]}` — declared paged, genuinely paging,
+          // and still unable to say which kind of nothing it found.
+          return buildCursorList({
+            entity: 'CustomFieldValue',
+            key: 'values',
+            rows: walked.rows.map(slimCustomFieldValue),
             nextPage: walked.nextPage,
-            ...(walked.paging ? { paging: walked.paging } : {}),
-            ...(walked.cursorStalled ? { truncatedBy: 'cursor' } : {}),
-          };
+            // A value is a label; there is no amount to sum.
+            sumField: null,
+            paging: walked.paging,
+            cursorStalled: walked.cursorStalled,
+            billPages: walked.billPages,
+            witnesses:
+              walked.rows.length === 0
+                ? await valuesNamedByTransactions(client, customFieldId)
+                : undefined,
+          });
         },
         { narrowing: cursorNarrowing({ format: false }) },
       ),
