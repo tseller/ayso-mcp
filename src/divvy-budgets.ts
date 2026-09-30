@@ -28,15 +28,16 @@
  * same discipline for the zero-row case).
  */
 
-import { BILL_MAX_PAGE_SIZE, PagingCheck } from "./divvy-paging.js";
+import {
+  BILL_MAX_PAGE_SIZE,
+  walkBillPages,
+  type BillListName,
+  type BillPage,
+  type WalkInput,
+} from "./divvy-paging.js";
 import { describeEmpty, type Witness } from "./empty-listing.js";
 
 export type Raw = Record<string, unknown>;
-
-export interface BillPage<T> {
-  results?: T[];
-  nextPage?: string;
-}
 
 /** What assembling a budget listing needs of a BILL client. */
 export interface BudgetApi {
@@ -68,13 +69,11 @@ interface BudgetRef {
  */
 const MAX_CARD_PAGES = 5;
 const MAX_TRANSACTION_PAGES = 4;
-// BILL's own page maximum per endpoint, declared once in src/divvy-paging.ts —
-// these were three literals here, a fourth in the transaction tool and nothing
-// at all in the schemas, which is how `pageSize: "100"` on a list BILL caps at
-// 50 became a raw backend 400 (issue #24).
-const TRANSACTION_PAGE_SIZE = String(BILL_MAX_PAGE_SIZE.transactions);
-const CARD_PAGE_SIZE = String(BILL_MAX_PAGE_SIZE.cards);
-const BUDGET_PAGE_SIZE = String(BILL_MAX_PAGE_SIZE.budgets);
+// Each walk asks BILL for its own page maximum per endpoint — read by
+// `walkBillPages` from src/divvy-paging.ts, where it is declared once. These
+// were three literals here, a fourth in the transaction tool and nothing at all
+// in the schemas, which is how `pageSize: "100"` on a list BILL caps at 50
+// became a raw backend 400 (issue #24).
 const MAX_BUDGET_PAGES = 10;
 /** How many discovered budgets are read back by id in one call. */
 const MAX_READBACK = 100;
@@ -95,27 +94,29 @@ function addRef(into: Map<string, BudgetRef>, ref: BudgetRef): void {
 }
 
 /**
- * Walks one source's BILL pages. `PagingCheck` is what decides whether a cursor
- * advanced: this loop used to stop on `next === cursor`, which a backend
- * re-serving a page under a fresh cursor string walks straight past — it would
- * then add the same budgets again on every one of `maxPages` requests (issue
- * #33). Comparing the pages themselves is the check that does not depend on the
- * backend being tidy about its cursor strings.
+ * Walks one source's BILL pages — through `walkBillPages`, the walker every
+ * other BILL listing uses, not one of this module's own.
+ *
+ * This used to be a local loop. It stopped on `next === cursor`, which a
+ * backend re-serving a page under a fresh cursor string walks straight past,
+ * and the #33 witness reached it only because someone edited it by hand: the
+ * rule lived in src/divvy-paging.ts and the loop lived here (issue #60). A
+ * source's bound is `maxPages` full BILL pages, which is what `target` and
+ * `maxPages` together say; a paging improvement made to the shared walker now
+ * arrives here without anyone remembering this file exists.
  */
-async function walk<T>(
-  fetchPage: (cursor?: string) => Promise<BillPage<T>>,
+async function walk(
+  list: BillListName,
   maxPages: number,
-): Promise<{ rows: T[]; pages: number }> {
-  const rows: T[] = [];
-  const paging = new PagingCheck();
-  let pages = 0;
-  while (pages < maxPages) {
-    const page = await fetchPage(paging.page);
-    pages += 1;
-    rows.push(...paging.observe(page.results, page.nextPage));
-    if (!paging.hasMore) break;
-  }
-  return { rows, pages };
+  fetch: WalkInput<Raw>["fetch"],
+): Promise<{ rows: Raw[]; pages: number }> {
+  const { rows, billPages } = await walkBillPages<Raw>({
+    list,
+    target: BILL_MAX_PAGE_SIZE[list] * maxPages,
+    maxPages,
+    fetch,
+  });
+  return { rows, pages: billPages };
 }
 
 /**
@@ -135,10 +136,7 @@ interface DiscoverySource {
 const CARDS: DiscoverySource = {
   name: "cards",
   async run(api) {
-    const { rows, pages } = await walk(
-      (cursor) => api.listCards({ page: cursor, pageSize: CARD_PAGE_SIZE }),
-      MAX_CARD_PAGES,
-    );
+    const { rows, pages } = await walk("cards", MAX_CARD_PAGES, (p) => api.listCards(p));
     return {
       refs: rows.map((c) => ({ id: c.budgetId as string, uuid: c.budgetUuid as string })),
       scanned: rows.length,
@@ -152,9 +150,8 @@ const CARDS: DiscoverySource = {
 const TRANSACTIONS: DiscoverySource = {
   name: "transactions",
   async run(api) {
-    const { rows, pages } = await walk(
-      (cursor) => api.listTransactions({ page: cursor, pageSize: TRANSACTION_PAGE_SIZE }),
-      MAX_TRANSACTION_PAGES,
+    const { rows, pages } = await walk("transactions", MAX_TRANSACTION_PAGES, (p) =>
+      api.listTransactions(p),
     );
     return {
       refs: rows.map((t) => ({
@@ -188,9 +185,8 @@ async function fromBillList(
   const perFilter: Record<string, number> = {};
   let pages = 0;
   for (const filters of ["retired:eq:false", "retired:eq:true"]) {
-    const walked = await walk(
-      (cursor) => api.listBudgetsPage({ filters, page: cursor, pageSize: BUDGET_PAGE_SIZE }),
-      MAX_BUDGET_PAGES,
+    const walked = await walk("budgets", MAX_BUDGET_PAGES, (p) =>
+      api.listBudgetsPage({ filters, ...p }),
     );
     pages += walked.pages;
     perFilter[filters] = walked.rows.length;

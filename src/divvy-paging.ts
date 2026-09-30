@@ -108,7 +108,7 @@ export const UNPAGED_DIVVY_LISTS: Record<string, string> = {
   divvy_list_members:
     "GET /v3/spend/members answers 404 on these books — there is no list to page yet. Issue #38 owns it, and a cursor here would be a knob over a hole.",
   divvy_list_pending_action:
-    "a triage view over the transaction list rather than a BILL endpoint: it walks `transactions` itself and buckets what it finds, so the rows it returns are not one BILL page.",
+    "a triage view over the transaction list rather than a BILL endpoint: it walks `transactions` (through `walkBillPages`, like every BILL walk) and buckets what it finds, so the rows it returns are not one BILL page.",
 };
 
 /**
@@ -426,6 +426,16 @@ export interface WalkInput<T> {
   measure?(row: T): number;
   /** Character budget for the accumulated rows. */
   budgetChars?: number;
+  /**
+   * How many BILL pages this walk may consume. Defaults to
+   * `MAX_BILL_PAGES_PER_CALL`, the bound for a tool call that answers one
+   * caller's page. A walk that is not serving a caller's page — the budget
+   * assembler's per-source scans, the pending-action triage over the whole
+   * transaction list — states its own bound here rather than hand-rolling a
+   * loop to get one, which is how those two walkers came to miss the #33
+   * witness until it was added to each by hand (issue #60).
+   */
+  maxPages?: number;
 }
 
 export interface Walked<T> {
@@ -473,6 +483,7 @@ export async function walkBillPages<T>({
   keep,
   measure,
   budgetChars,
+  maxPages = MAX_BILL_PAGES_PER_CALL,
 }: WalkInput<T>): Promise<Walked<T>> {
   const billPageSize = BILL_MAX_PAGE_SIZE[list];
   const wanted = Math.max(1, Math.floor(target));
@@ -498,7 +509,7 @@ export async function walkBillPages<T>({
   } while (
     paging.hasMore &&
     rows.length < wanted &&
-    billPages < MAX_BILL_PAGES_PER_CALL &&
+    billPages < maxPages &&
     (budgetChars === undefined || chars < budgetChars)
   );
 

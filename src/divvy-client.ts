@@ -1,8 +1,7 @@
 import { FilterCheck } from './divvy-filters.js';
 import {
-  BILL_MAX_PAGE_SIZE,
-  PagingCheck,
   billPagingParams,
+  walkBillPages,
   type BillPage,
 } from './divvy-paging.js';
 
@@ -255,45 +254,42 @@ export class DivvyClient {
   }> {
     const pendingFields: PendingActionRow[] = [];
     const pendingReview: PendingActionRow[] = [];
-    let safety = 50;
     const check = new FilterCheck({ startDate: params?.since });
-    // This walk used to stop on `next === cursor` — a cursor string BILL
-    // repeats. A backend re-serving the same page under a FRESH cursor string
-    // satisfies that test and walks on, 50 times, bucketing every row again;
-    // `PagingCheck` compares the pages instead of the strings (issue #33).
-    const paging = new PagingCheck();
-    do {
-      const resp = (await this.getBillPage('/v3/spend/transactions', {
-        filters: check.billParam,
-        page: paging.page,
-        pageSize: String(BILL_MAX_PAGE_SIZE.transactions),
-      })) as { results?: RawTransaction[]; nextPage?: string };
-      const results = check.keep(
-        paging.observe(resp.results, resp.nextPage) as unknown as Record<string, unknown>[],
-      ) as unknown as RawTransaction[];
-      for (const tx of results) {
-        if (TERMINAL_STATUSES.has(tx.status ?? '')) continue;
-        const row = shapePendingRow(tx);
-        if (row.blockers.length > 0) {
-          pendingFields.push(row);
-        } else if (
-          tx.reviewRequired &&
-          Array.isArray(tx.reviewers) &&
-          tx.reviewers.some(
-            (r) =>
-              r.status === 'WAITING' &&
-              (!params?.reviewerUuid || r.userUuid === params.reviewerUuid),
-          )
-        ) {
-          pendingReview.push(row);
-        }
+    // The whole transaction list, through the one walker every BILL listing
+    // uses. This was a hand-rolled loop that stopped on `next === cursor`; the
+    // #33 witness reached it only by being pasted in (issue #60), so it goes
+    // through `walkBillPages` now and inherits whatever that learns next.
+    const { rows } = await walkBillPages<Record<string, unknown>>({
+      list: 'transactions',
+      target: Infinity,
+      maxPages: PENDING_ACTION_MAX_PAGES,
+      fetch: (p) =>
+        this.getBillPage('/v3/spend/transactions', { filters: check.billParam, ...p }),
+      keep: (got) => check.keep(got),
+    });
+    for (const tx of rows as unknown as RawTransaction[]) {
+      if (TERMINAL_STATUSES.has(tx.status ?? '')) continue;
+      const row = shapePendingRow(tx);
+      if (row.blockers.length > 0) {
+        pendingFields.push(row);
+      } else if (
+        tx.reviewRequired &&
+        Array.isArray(tx.reviewers) &&
+        tx.reviewers.some(
+          (r) =>
+            r.status === 'WAITING' &&
+            (!params?.reviewerUuid || r.userUuid === params.reviewerUuid),
+        )
+      ) {
+        pendingReview.push(row);
       }
-      if (!paging.hasMore) break;
-      safety -= 1;
-    } while (safety > 0);
+    }
     return { pendingFields, pendingReview };
   }
 }
+
+/** The pending-action walk reads the whole transaction list, up to this many BILL pages. */
+const PENDING_ACTION_MAX_PAGES = 50;
 
 const TERMINAL_STATUSES = new Set(['APPROVED', 'COMPLETE', 'DECLINED', 'DENIED', 'REVIEWED']);
 
