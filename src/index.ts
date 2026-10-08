@@ -91,7 +91,7 @@ function registerAllTools(server: McpServer) {
 
   if (divvyApiToken) {
     const divvyClient = new DivvyClient(divvyApiToken);
-    registerDivvyTools(server, divvyClient);
+    registerDivvyTools(server, divvyClient, { gmail: gmailClientFromEnv() });
   }
 }
 

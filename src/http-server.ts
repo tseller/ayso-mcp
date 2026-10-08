@@ -102,7 +102,7 @@ export function startHttpServer(qboConfig?: QboConfig): void {
 
     const divvyToken = process.env.DIVVY_API_TOKEN;
     if (divvyToken) {
-      registerDivvyTools(server, new DivvyClient(divvyToken));
+      registerDivvyTools(server, new DivvyClient(divvyToken), { gmail });
     }
 
     return server;
