@@ -2,7 +2,8 @@ import { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import { DivvyClient } from '../divvy-client.js';
 import { runTool } from '../tool-logging.js';
-import { sniffContentType } from '../mime.js';
+import { FILE_SOURCE, FILE_SOURCE_DOC, resolveFileSource } from '../file-source.js';
+import type { GmailClient } from '../gmail-client.js';
 import {
   buildCursorList,
   selectedValueLabels,
@@ -118,7 +119,16 @@ const valuesNamedByTransactions = async (
   return sighted ? witnesses : [];
 };
 
-export function registerDivvyTools(server: McpServer, client: DivvyClient): void {
+export interface DivvyToolDeps {
+  /** Enables the Gmail source on divvy_upload_receipt. */
+  gmail?: GmailClient;
+}
+
+export function registerDivvyTools(
+  server: McpServer,
+  client: DivvyClient,
+  deps: DivvyToolDeps = {},
+): void {
   server.registerTool(
     'divvy_list_budgets',
     {
@@ -238,23 +248,24 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
   server.registerTool(
     'divvy_upload_receipt',
     {
-      description: 'Upload a receipt and attach it to a Divvy transaction. Accepts JPEG, PNG, GIF, WebP, HEIC, and PDF — the MIME type is auto-detected from the file bytes, so you generally do not need to specify contentType.',
+      description: 'Upload a receipt and attach it to a Divvy transaction. ' + FILE_SOURCE_DOC +
+      ' The MIME type is auto-detected from the file bytes, so you generally do not need to specify contentType.',
       inputSchema: z.object({
       transactionUuid: z.string().describe('Transaction UUID (the uuid field, not the id field)'),
-      imageBase64: z.string().describe('Base64-encoded receipt bytes (image or PDF)'),
-      contentType: z.string().optional().describe('Optional MIME override. Only set this if the auto-detected type is wrong.'),
+      ...FILE_SOURCE,
+      imageBase64: z
+        .string()
+        .optional()
+        .describe('Deprecated alias of fileBase64, kept so existing callers still work.'),
     }),
     },
     (args) =>
-      runTool('divvy_upload_receipt', args, async ({ transactionUuid, imageBase64, contentType }) => {
-        const imageData = Buffer.from(imageBase64, 'base64');
-        const sniffed = sniffContentType(imageData);
-        const mime = contentType || sniffed || 'application/octet-stream';
-        if (contentType && sniffed && contentType !== sniffed) {
-          console.error(
-            `[tool] divvy_upload_receipt warn=mime_mismatch override=${contentType} sniffed=${sniffed}`,
-          );
-        }
+      runTool('divvy_upload_receipt', args, async ({ transactionUuid, imageBase64, ...fileArgs }) => {
+        const { data: imageData, source, mime, sniffed } = await resolveFileSource(
+          'divvy_upload_receipt',
+          { ...fileArgs, fileBase64: fileArgs.fileBase64 ?? imageBase64 },
+          { gmail: deps.gmail },
+        );
         // Cheap pre-check: BILL refuses receipt-attach on locked (settled/
         // reconciled) transactions and returns an opaque 500 "Please retry".
         // Detect it *before* uploading bytes to S3, so we neither orphan an
@@ -275,14 +286,14 @@ export function registerDivvyTools(server: McpServer, client: DivvyClient): void
           );
         }
         console.error(
-          `[tool] divvy_upload_receipt step=getUrl transactionUuid=${transactionUuid} mime=${mime} sniffed=${sniffed ?? 'unknown'} override=${contentType ?? 'none'} bytes=${imageData.length}`,
+          `[tool] divvy_upload_receipt step=getUrl transactionUuid=${transactionUuid} mime=${mime} sniffed=${sniffed ?? 'unknown'} override=${fileArgs.contentType ?? 'none'} source=${source} bytes=${imageData.length}`,
         );
         const { url } = await client.getReceiptUploadUrl();
         console.error(`[tool] divvy_upload_receipt step=put urlHost=${new URL(url).host}`);
         await client.uploadReceiptFile(url, imageData, mime);
         console.error(`[tool] divvy_upload_receipt step=attach`);
         const result = await client.attachReceiptToTransaction(transactionUuid, url);
-        return { success: true, result, detectedMime: sniffed };
+        return { success: true, result, detectedMime: sniffed, source, bytes: imageData.length };
       }),
   );
 

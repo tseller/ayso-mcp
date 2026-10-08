@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/server";
 import { QboClient, QboError } from "../qbo-client.js";
-import { sniffContentType } from "../mime.js";
+import { FILE_SOURCE, FILE_SOURCE_DOC, resolveFileSource } from "../file-source.js";
 import { IdempotencyStore, withIdempotency } from "../idempotency.js";
 import type { GmailClient } from "../gmail-client.js";
 import { mergeLinePatches, type LineFieldPatch, type QboLine } from "../class-lines.js";
@@ -24,36 +24,6 @@ const CLASS_ID_DESC =
  */
 const REPLACE_WARNING =
   "Replacing lines discards every field the schema below cannot express — the line Id, TaxCodeRef, BillableStatus, CustomerRef and LineNum that QuickBooks put there. To change one field on an existing line, pass its lineId and only the fields you want changed; to add a class to an existing transaction, use qbo_set_transaction_class instead.";
-
-// QBO's documented attachment ceiling is 100MB, but we buffer the whole file in
-// memory on Cloud Run, so cap URL fetches well below that.
-const MAX_URL_FILE_BYTES = 30 * 1024 * 1024;
-
-async function fetchFileFromUrl(
-  fileUrl: string,
-): Promise<{ data: Buffer; contentType?: string; fileName?: string }> {
-  const parsed = new URL(fileUrl);
-  if (parsed.protocol !== "https:") {
-    throw new Error(`fileUrl must be https (got ${parsed.protocol}//)`);
-  }
-  const res = await fetch(fileUrl, { redirect: "follow" });
-  if (!res.ok) {
-    throw new Error(`fetching fileUrl failed: ${res.status} ${res.statusText}`);
-  }
-  const data = Buffer.from(await res.arrayBuffer());
-  if (data.length === 0) throw new Error("fileUrl returned an empty body");
-  if (data.length > MAX_URL_FILE_BYTES) {
-    throw new Error(
-      `fileUrl body is ${data.length} bytes, over the ${MAX_URL_FILE_BYTES}-byte limit`,
-    );
-  }
-  const contentType = res.headers.get("content-type")?.split(";")[0].trim() || undefined;
-  const disposition = res.headers.get("content-disposition") ?? "";
-  const dispositionName = /filename="?([^";]+)"?/i.exec(disposition)?.[1];
-  const lastSegment = decodeURIComponent(parsed.pathname.split("/").filter(Boolean).pop() ?? "");
-  const fileName = dispositionName || (lastSegment.includes(".") ? lastSegment : undefined);
-  return { data, contentType, fileName };
-}
 
 export interface LineInput {
   lineId?: string;
@@ -758,113 +728,28 @@ export function registerQboTransactionTools(
   server.registerTool(
     "qbo_attach_file",
     {
-      description: "Attach a file (receipt, invoice, supporting doc) to a QuickBooks transaction. Provide the file ONE of three ways: fileUrl (https URL the server fetches directly), gmailMessageId + gmailAttachmentId (server pulls the attachment straight from Gmail — use the Gmail MCP to find the ids), or fileBase64 (raw bytes, fallback). File bytes are validated by magic numbers (PDF, JPEG, PNG, GIF, WebP, HEIC) before upload. Returns the created Attachable id and filename. Provide the transaction's entity type (e.g. Purchase, Deposit, Bill, Transfer) and its Id (from the list/get tools).",
+      description: "Attach a file (receipt, invoice, supporting doc) to a QuickBooks transaction. " + FILE_SOURCE_DOC + " Returns the created Attachable id and filename. Provide the transaction's entity type (e.g. Purchase, Deposit, Bill, Transfer) and its Id (from the list/get tools).",
       inputSchema: z.object({
       entityType: z
         .enum(["Purchase", "Deposit", "Bill", "Transfer", "Invoice", "JournalEntry", "VendorCredit"])
         .describe("QBO entity type of the transaction to attach to"),
       entityId: z.string().describe("Transaction Id (the entity's Id, from list/get tools)"),
-      fileBase64: z
-        .string()
-        .optional()
-        .describe("Base64-encoded file bytes (image or PDF). Fallback — prefer fileUrl or the Gmail source."),
-      fileUrl: z
-        .string()
-        .url()
-        .optional()
-        .describe("https URL to fetch the file from server-side (e.g. an invoice download link)."),
-      gmailMessageId: z
-        .string()
-        .optional()
-        .describe("Gmail message id containing the attachment (pair with gmailAttachmentId)"),
-      gmailAttachmentId: z
-        .string()
-        .optional()
-        .describe("Gmail attachment id within the message (pair with gmailMessageId)"),
-      gmailAccount: z
-        .string()
-        .optional()
-        .describe(
-          "Gmail account email to fetch from. Optional when only one account is configured on the server.",
-        ),
+      ...FILE_SOURCE,
       fileName: z
         .string()
         .optional()
         .describe(
           "File name to store in QBO (default: derived from the Gmail attachment or URL, else 'attachment')",
         ),
-      contentType: z
-        .string()
-        .optional()
-        .describe("Optional MIME override. Only set this if the auto-detected type is wrong."),
     }),
     },
     (args) =>
-      runTool("qbo_attach_file", args, async ({
-        entityType,
-        entityId,
-        fileBase64,
-        fileUrl,
-        gmailMessageId,
-        gmailAttachmentId,
-        gmailAccount,
-        fileName,
-        contentType,
-      }) => {
-        const wantsGmail = !!(gmailMessageId || gmailAttachmentId || gmailAccount);
-        const sources = [!!fileBase64, !!fileUrl, wantsGmail].filter(Boolean).length;
-        if (sources !== 1) {
-          throw new Error(
-            "provide exactly one file source — fileBase64, fileUrl, or gmailMessageId + gmailAttachmentId",
-          );
-        }
-
-        let fileData: Buffer;
-        let source: string;
-        let sourceContentType: string | undefined;
-        let sourceFileName: string | undefined;
-        if (fileUrl) {
-          source = "url";
-          ({ data: fileData, contentType: sourceContentType, fileName: sourceFileName } =
-            await fetchFileFromUrl(fileUrl));
-        } else if (wantsGmail) {
-          if (!gmail) {
-            throw new Error(
-              "the Gmail source is not configured on this server. Set GMAIL_REFRESH_TOKENS (mint tokens with `npm run gmail:link`) — or use fileUrl/fileBase64.",
-            );
-          }
-          if (!gmailMessageId || !gmailAttachmentId) {
-            throw new Error("the Gmail source needs both gmailMessageId and gmailAttachmentId");
-          }
-          source = "gmail";
-          const fetched = await gmail.getAttachment(gmailAccount, gmailMessageId, gmailAttachmentId);
-          fileData = fetched.data;
-          sourceContentType = fetched.mimeType;
-          sourceFileName = fetched.fileName;
-        } else {
-          source = "base64";
-          fileData = Buffer.from(fileBase64!, "base64");
-        }
-
-        // Validate magic bytes before uploading — catches truncated/corrupted
-        // transfers and non-document payloads. contentType is an explicit
-        // escape hatch for formats the sniffer doesn't know.
-        const sniffed = sniffContentType(fileData);
-        if (!sniffed && !contentType) {
-          const head = fileData.subarray(0, 8).toString("hex");
-          throw new Error(
-            `file bytes don't match any supported format (PDF, JPEG, PNG, GIF, WebP, HEIC) — first bytes: ${head || "(empty)"}, size: ${fileData.length}. If the format is genuinely something else, pass contentType explicitly.`,
-          );
-        }
-        const mime = contentType || sniffed || sourceContentType || "application/octet-stream";
-        if (contentType && sniffed && contentType !== sniffed) {
-          console.error(
-            `[tool] qbo_attach_file warn=mime_mismatch override=${contentType} sniffed=${sniffed}`,
-          );
-        }
+      runTool("qbo_attach_file", args, async ({ entityType, entityId, fileName, ...fileArgs }) => {
+        const { data: fileData, source, mime, sniffed, fileName: sourceFileName } =
+          await resolveFileSource("qbo_attach_file", fileArgs, { gmail });
         const name = fileName || sourceFileName || "attachment";
         console.error(
-          `[tool] qbo_attach_file entityType=${entityType} entityId=${entityId} mime=${mime} sniffed=${sniffed ?? "unknown"} override=${contentType ?? "none"} source=${source} bytes=${fileData.length}`,
+          `[tool] qbo_attach_file entityType=${entityType} entityId=${entityId} mime=${mime} sniffed=${sniffed ?? "unknown"} override=${fileArgs.contentType ?? "none"} source=${source} bytes=${fileData.length}`,
         );
         const result = await client.uploadAttachment(entityType, entityId, name, mime, fileData);
         const attachable = (
