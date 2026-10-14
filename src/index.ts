@@ -15,6 +15,8 @@ import { registerQboBudgetTools } from "./tools/qbo-budgets.js";
 import { startHttpServer } from "./http-server.js";
 import { DivvyClient } from "./divvy-client.js";
 import { registerDivvyTools } from "./tools/divvy.js";
+import { registerSportsConnectTools } from "./tools/sportsconnect.js";
+import { sportsConnectClientFromEnv } from "./sportsconnect-client.js";
 import { IdempotencyStore } from "./idempotency.js";
 import { InMemoryOAuthStore } from "./oauth-store.js";
 import { gmailClientFromEnv } from "./gmail-client.js";
@@ -62,7 +64,16 @@ if (divvyApiToken) {
   console.error("[mcp] Divvy tools disabled (missing DIVVY_API_TOKEN)");
 }
 
-if (!hasQbo && !divvyApiToken) {
+// --- Sports Connect config (optional) ---
+
+const sportsConnect = sportsConnectClientFromEnv();
+console.error(
+  sportsConnect
+    ? "[mcp] Sports Connect tools enabled"
+    : "[mcp] Sports Connect tools disabled (missing SPORTSCONNECT_USERNAME/SPORTSCONNECT_PASSWORD)",
+);
+
+if (!hasQbo && !divvyApiToken && !sportsConnect) {
   console.error("ERROR: No integrations configured. Set QuickBooks and/or Divvy env vars.");
   process.exit(1);
 }
@@ -92,6 +103,10 @@ function registerAllTools(server: McpServer) {
   if (divvyApiToken) {
     const divvyClient = new DivvyClient(divvyApiToken);
     registerDivvyTools(server, divvyClient, { gmail: gmailClientFromEnv() });
+  }
+
+  if (sportsConnect) {
+    registerSportsConnectTools(server, sportsConnect);
   }
 }
 
