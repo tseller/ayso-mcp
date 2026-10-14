@@ -63,7 +63,8 @@ gcloud config configurations activate mcp-billcom
 - `src/divvy-rows.ts` — the flattened Divvy rows (`slimTransaction`, `slimCard`, `slimCustomField`, `slimCustomFieldValue`) plus `buildCursorList()`, the cursor-paged twin of `buildEntityList()`: same `returned`/`pageTotal`/`hasMore`/`truncatedBy`/`note` vocabulary, but the position is BILL's opaque `nextPage`, and `truncatedBy` has a third value (`cursor`) for the cursor that did not advance. No `rowCount` — BILL's list returns no total, and an omitted count beats an invented one. It carries the `paging` block the same way it carries `filtering`
 - `src/sportsconnect-client.ts` — Sports Connect (Stack Sports / Blue Sombrero) admin access for Millbrae AYSO's portal, **read-only by construction** (`READ_ENDPOINTS`) and **browserless** — see "Sports Connect" below
 - `src/sportsconnect-orders.ts` — reading an order from the model its view page embeds, finding orders by name, and finding refunds since a date
-- `src/tools/sportsconnect.ts` — Sports Connect: order_lookup, refunds_since
+- `src/sportsconnect-enrollment.ts` — enrollment by program and division, and one division's players: one read of the Enrollment Details report plus the wait list from the Line Item Order report, and one rule for what counts as enrolled — see "Enrollment" under "Sports Connect" below
+- `src/tools/sportsconnect.ts` — Sports Connect: order_lookup, refunds_since, enrollment_counts, division_roster
 - `src/protocol-version.ts` — legacy-era protocol-version negotiation + header reconciliation (see "Protocol version" below)
 - `src/era-routing.ts` — which leg of `/mcp` serves a request: the SDK's `classifyInboundRequest`, plus the one rule that goes in front of it (an `Mcp-Session-Id` means legacy, always). See "Protocol eras" below
 - `src/discover.ts` — what the modern leg advertises, read by **asking** the modern leg rather than restating it beside it. No protocol revision is hard-coded in this repo; a test greps for one
@@ -913,6 +914,47 @@ read 263 orders in ~60s and found 10 refunds totalling $2,523.50. One of them is
 the control a pilot had already confirmed by hand (a $240 card refund on
 2026-07-30). Family names and order numbers are left out on purpose: this
 repository is public.
+
+### Enrollment
+
+`sportsconnect_enrollment_counts` (per program and division) and
+`sportsconnect_division_roster` (one division's players) are built from one
+read and one rule (`src/sportsconnect-enrollment.ts`), so a division's count
+and its roster cannot disagree. The source is the *Enrollment Details* report,
+asked with **no condition** — it is a few hundred rows (~6s) and every filter
+is applied here, against the rows.
+
+Traps worth knowing (probed live 2026-10-14):
+
+- **A row is a line item, not a player.** Every declined card attempt is its own
+  `Failed` order and a transfer leaves the old order `Cancelled` beside the new
+  one, so a player can have four rows in one division. One player in one
+  division counts once.
+- **The report returns distinct rows over the columns asked for.** Program and
+  division alone collapse 667 line items to 593; program alone gives 574.
+  `OrderDetailsOrderDetailId` is always selected so de-duplication is ours.
+- **Enrolled = not `Cancelled` and not `Failed`** — the conditions the
+  portal's own Enrollment Details report ships with (`StandardReport/…`).
+  `Pending` counts and is broken out.
+- **Enrollment Details leaves out the wait list.** A wait-listed player has a
+  live `Wait List Registration` line item and no Enrollment Details row at all.
+  It is read from the *Line Item Order* report per program
+  (`ProgramsProgramId` + `OrderDetailsDetail` conditions, ~2s; unscoped it walks
+  every season and takes minutes), both conditions re-checked per row, and
+  counted as `waitlisted` beside `enrolled`, never in it.
+- **The Line Item Order report is not an enrollment count.** A cancellation
+  creates a new `Completed` order holding a `Cancellation` line item, so live
+  line items there over-count. Reconciled on the Fall program: 582 players with
+  a live line item = 555 enrolled + 18 cancellations + 9 wait-listed.
+- **Current programs only.** Unconditioned, Enrollment Details returns only
+  programs whose divisions have not ended; past seasons are not in it.
+- The static *Enrollment Summary* report (`StaticReport/execute`) answers 500
+  for this login, like the billing reports.
+
+Live portal, 2026-10-14: 556 enrolled (555 in the Fall CORE program, one
+volunteer), 9 wait-listed (8 in 14U Boys, which is 21 enrolled against a cap of
+18), counts in ~6s and 2.6k chars; the 10U Girls roster is 34 players, 10.3k
+chars.
 
 ## Environment Variables
 
