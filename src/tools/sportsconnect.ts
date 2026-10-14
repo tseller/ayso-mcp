@@ -2,11 +2,34 @@ import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import type { SportsConnectClient } from "../sportsconnect-client.js";
 import { findOrdersByName, findRefunds, getOrder, getOrders } from "../sportsconnect-orders.js";
+import {
+  allDivisions,
+  countByDivision,
+  isLive,
+  matchingDivisions,
+  matchingPrograms,
+  readEnrollment,
+  roster,
+  type EnrollmentRead,
+} from "../sportsconnect-enrollment.js";
 import { describeEmpty } from "../empty-listing.js";
 import { runTool } from "../tool-logging.js";
 
 /** Orders one name lookup will read in full. */
 const MAX_LOOKUP_ORDERS = 15;
+
+/** What an enrollment answer read, stated the same way by both enrollment tools. */
+function enrollmentSource(read: EnrollmentRead): string {
+  const { cancelled, failed, duplicate } = read.notCounted;
+  return (
+    `Sports Connect's Enrollment Details report sent ${read.lineItems} registration line item(s)` +
+    (read.capped ? ` of ${read.totalRecords} (capped — counts are short)` : "") +
+    `; one player in one division counts once. Not counted: ${cancelled} cancelled or transferred-out line item(s), ` +
+    `${failed} declined-payment attempt(s)` +
+    (duplicate ? `, ${duplicate} second live registration(s) of a player already counted` : "") +
+    `. The report holds current programs only (divisions not yet ended), not past seasons. Wait list: ${read.waitList}.`
+  );
+}
 
 const isoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "a date as YYYY-MM-DD");
 
@@ -86,6 +109,102 @@ export function registerSportsConnectTools(server: McpServer, client: SportsConn
               }
             : {}),
           refunds: found.refunds,
+        };
+      }),
+  );
+
+  server.registerTool(
+    "sportsconnect_enrollment_counts",
+    {
+      description:
+        "Enrollment counts for Millbrae AYSO from Sports Connect, by program and division — read-only. " +
+        "Each division states `enrolled` (players registered and not cancelled — Sports Connect's own Enrollment Details rule), " +
+        "`pending` (of those, payment not complete), `maxPlayers` (the division's cap, when one is set), `teams` and `unallocated` " +
+        "(enrolled players not yet on a team), `waitlisted` (on the division's wait list — not part of `enrolled`), " +
+        "and `notEnrolled` (players whose every registration there was cancelled, transferred out or declined). " +
+        "A player counts once per division however many orders they have. Covers the current programs Sports Connect holds open, not past seasons. " +
+        "Optional `program` narrows to programs whose name holds every word given (or a program id). " +
+        "For the players in one division, use sportsconnect_division_roster.",
+      inputSchema: z.object({
+        program: z.string().min(2).optional().describe('Words from the program name, e.g. "Fall Core", or a program id.'),
+      }),
+    },
+    (args) =>
+      runTool("sportsconnect_enrollment_counts", args, async ({ program }) => {
+        const read = await readEnrollment(client);
+        let es = read.enrollments;
+        if (program) {
+          const ids = matchingPrograms(es, program);
+          if (ids.size === 0) {
+            const names = [...new Set(es.map((e) => `${e.program} (${e.programId})`))];
+            throw new Error(`No current program matches "${program}". Programs Sports Connect holds: ${names.join("; ")}`);
+          }
+          es = es.filter((e) => ids.has(e.programId));
+        }
+        const programs = countByDivision(es);
+        const live = es.filter(isLive);
+        return {
+          enrolled: live.length,
+          players: new Set(live.map((e) => e.playerId)).size,
+          waitlisted: es.filter((e) => e.state === "waitlisted").length,
+          programs,
+          source: enrollmentSource(read),
+          ...(programs.length === 0 ? { empty: describeEmpty() } : {}),
+        };
+      }),
+  );
+
+  server.registerTool(
+    "sportsconnect_division_roster",
+    {
+      description:
+        "The players enrolled in one Millbrae AYSO division, from Sports Connect — read-only. " +
+        '`division` matches every word given against the division name ("10U Girls" → "10U - Girls"), or takes a division id; ' +
+        "add `program` when the same division name exists in more than one program. A name matching several divisions is an error " +
+        "listing them, never a merged roster. Each player comes with team (\"Unallocated\" until placed), status (`enrolled`/`pending`), " +
+        "birth date, gender, the order, and the parent account's name, email and cell phone. " +
+        "The roster is the same set `sportsconnect_enrollment_counts` counts. Players on the division's wait list come back separately " +
+        "under `waitList` (name, order, parent contact; Sports Connect's wait list carries no team or birth date). " +
+        "`includeCancelled` adds the players whose registration there was cancelled, transferred out or declined, marked by status.",
+      inputSchema: z.object({
+        division: z.string().min(2).describe('Words from the division name, e.g. "10U Girls", or a division id.'),
+        program: z.string().min(2).optional().describe("Words from the program name, or a program id, when the division name is ambiguous."),
+        includeCancelled: z.boolean().optional().describe("Also list players whose registration in this division is no longer live."),
+      }),
+    },
+    (args) =>
+      runTool("sportsconnect_division_roster", args, async ({ division, program, includeCancelled }) => {
+        const read = await readEnrollment(client);
+        const found = matchingDivisions(read.enrollments, division, program);
+        if (found.length === 0) {
+          throw new Error(
+            `No current division matches "${division}"${program ? ` in a program matching "${program}"` : ""}. ` +
+              `Divisions Sports Connect holds: ${allDivisions(read.enrollments).join("; ")}`,
+          );
+        }
+        if (found.length > 1) {
+          throw new Error(
+            `"${division}" matches ${found.length} divisions — name one (or pass its id as \`division\`, or add \`program\`): ` +
+              found.map((d) => `${d.division} [${d.divisionId}] in ${d.program}`).join("; "),
+          );
+        }
+        const d = found[0];
+        const players = roster(read.enrollments, d.divisionId, (e) =>
+          isLive(e) || (!!includeCancelled && (e.state === "cancelled" || e.state === "failed")),
+        );
+        const waitList = roster(read.enrollments, d.divisionId, (e) => e.state === "waitlisted");
+        const { division: _name, divisionId: _id, ...count } = countByDivision(read.enrollments.filter((e) => e.divisionId === d.divisionId))[0].divisions[0];
+        return {
+          division: d.division,
+          divisionId: d.divisionId,
+          program: d.program,
+          programId: d.programId,
+          ...count,
+          returned: players.length,
+          source: enrollmentSource(read),
+          ...(players.length === 0 ? { empty: describeEmpty() } : {}),
+          players,
+          ...(waitList.length ? { waitList } : {}),
         };
       }),
   );
