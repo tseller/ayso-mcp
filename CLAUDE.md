@@ -61,6 +61,9 @@ gcloud config configurations activate mcp-billcom
 - `src/divvy-budgets.ts` — the assembled budget listing (`assembleBudgets`, `slimBudget`); its sources page through `walkBillPages` like every other BILL walk. BILL's `/v3/spend/budgets` does not return every budget on these books, so the listing is built from the sources that do name one — see "Budgets" below
 - `src/empty-listing.ts` — `describeEmpty()`, the `empty` block a zero-row listing carries. Attached by `buildEntityList` / `buildCursorList` for **every** list tool, so a bare `[]` cannot pose as "there are none" — see "Empty listings" below
 - `src/divvy-rows.ts` — the flattened Divvy rows (`slimTransaction`, `slimCard`, `slimCustomField`, `slimCustomFieldValue`) plus `buildCursorList()`, the cursor-paged twin of `buildEntityList()`: same `returned`/`pageTotal`/`hasMore`/`truncatedBy`/`note` vocabulary, but the position is BILL's opaque `nextPage`, and `truncatedBy` has a third value (`cursor`) for the cursor that did not advance. No `rowCount` — BILL's list returns no total, and an omitted count beats an invented one. It carries the `paging` block the same way it carries `filtering`
+- `src/sportsconnect-client.ts` — Sports Connect (Stack Sports / Blue Sombrero) admin access for Millbrae AYSO's portal, **read-only by construction** (`READ_ENDPOINTS`) and **browserless** — see "Sports Connect" below
+- `src/sportsconnect-orders.ts` — reading an order from the model its view page embeds, finding orders by name, and finding refunds since a date
+- `src/tools/sportsconnect.ts` — Sports Connect: order_lookup, refunds_since
 - `src/protocol-version.ts` — legacy-era protocol-version negotiation + header reconciliation (see "Protocol version" below)
 - `src/era-routing.ts` — which leg of `/mcp` serves a request: the SDK's `classifyInboundRequest`, plus the one rule that goes in front of it (an `Mcp-Session-Id` means legacy, always). See "Protocol eras" below
 - `src/discover.ts` — what the modern leg advertises, read by **asking** the modern leg rather than restating it beside it. No protocol revision is hard-coded in this repo; a test greps for one
@@ -838,6 +841,79 @@ drift.
 `protocol.preSessionMethodPolicy`, so a client (or a person) can learn what
 prod serves without provoking a refusal.
 
+## Sports Connect
+
+Some refunds never touch QBO: a registration is cancelled in Sports Connect and
+the money goes back to the family's card. Only the admin site can see those, so
+the server signs in as Tim's own Sports Connect admin login
+(`SPORTSCONNECT_USERNAME` / `SPORTSCONNECT_PASSWORD`). Stack Sports publishes no
+region-level API.
+
+**No browser.** The design started as headless Chromium + Playwright, and the
+first thing that happened is that `login.stacksports.com` (behind Imperva)
+refused the headless browser outright: `Access denied — Error 15`. Watching a
+real sign-in showed why a browser is not needed at all:
+
+1. The password step is **AWS Cognito SRP** against Stack Sports' user pool
+   (`us-west-2_AiiSrRjbC`, client `572but04so1ovl883vi2j95vpj`).
+   `USER_PASSWORD_AUTH` is disabled for that client, so it has to be SRP
+   (`amazon-cognito-identity-js`). Cognito is AWS, not Imperva.
+2. POSTing the id, access and refresh tokens (all three: the id token alone is a
+   400) to `core-api.bluesombrero.com/login/redirect/portal/14883` redirects
+   through the region site and `ayso.bluesombrero.com/autologin.aspx`, setting
+   the portal session cookies on all three hosts.
+3. From then on it is plain HTTPS with those cookies.
+
+That is ~3s, with no second factor on this login, so each instance signs in on
+first use and again if the portal bounces it to its login page (sessions last
+~1h). **Nothing is persisted**, so there is no stored session to encrypt or
+leak. The image is unchanged, so no 1-2 GB Chromium and no extra memory.
+
+**What it reads:**
+
+- **The order view page** (`Default.aspx?tabid=825475&mid=898304&orderId=…&ctl=vieworder`)
+  embeds the whole order as JSON in a hidden field, so there is no HTML scraping.
+  It is the authority for every amount, payment and refund a tool reports.
+- **The report wizard's JSON API**, `reporting.bluesombrero.com/proxy/reporting/api/v1/DynamicQuery/execute`,
+  on the *Line Item Order* report, used only to find which orders to read.
+
+**Read-only is structural.** `READ_ENDPOINTS` lists the only two requests the
+client can make, and `request()` refuses anything else before sending it, so the
+order editor (`ctl=manageorder`), refund actions and report saves cannot be
+expressed. A test pins this.
+
+Traps worth knowing (probed live 2026-10-14):
+
+- **A refund** is a payment row with a negative `PaymentAmount` and
+  `RefundOrderPaymentHistoryID` naming the payment it returned.
+- **A cancellation keeps the original order date.** The refund sits on a *new*
+  order (linked by `oldorderid`), still dated when the family first paid. So
+  "refunds since X" cannot filter on order date. `findRefunds` reads every
+  order whose cancel/transfer date **or** line-item updated date is on or after
+  X, then keeps the refund rows dated in range.
+- **The same refund can appear twice.** A cancel/transfer copies the old order's
+  payment rows, refunds included, onto the replacement order, and marks the old
+  copies `Cancelled`. Only the live copy counts (`countsAsRefund`).
+- **The report answers an operator it does not know with zero rows, not an
+  error** (`Bogus` → 0, `IsEqualTo` on a partial name → 0, `Contains` → 12).
+  Every row that comes back is therefore checked against the whole name or
+  date here, and the result says how many rows the report sent and how many
+  held. This is #29's rule again.
+- **The billing reports** (Daily Transaction, Daily Deposit) answer `500` even
+  in Sports Connect's own UI for this login, so they are not used.
+- `CancelOrTransferDate` is stamped at creation too. A tool only reports it when
+  it differs from the order date.
+- Order reads share one ASP.NET session, and under concurrency the portal
+  occasionally answers a readable order with an "Access Denied" redirect
+  (1 in 263). Each failure gets one solo retry, and anything still unreadable is
+  listed under `failed` rather than dropped.
+
+Live portal, 2026-10-14: `sportsconnect_refunds_since {"since":"2026-07-01"}`
+read 263 orders in ~60s and found 10 refunds totalling $2,523.50. One of them is
+the control a pilot had already confirmed by hand (a $240 card refund on
+2026-07-30). Family names and order numbers are left out on purpose: this
+repository is public.
+
 ## Environment Variables
 
 ### QuickBooks Online (optional — tools enabled if all are set)
@@ -845,6 +921,9 @@ prod serves without provoking a refusal.
 - `QBO_REALM_ID` — QuickBooks company ID (obtained during OAuth authorization)
 - `QBO_REFRESH_TOKEN` — OAuth2 refresh token (rolling: update after each refresh)
 - `QBO_BASE_URL` — optional override (default: production)
+
+### Sports Connect (optional — read-only tools enabled if both are set)
+- `SPORTSCONNECT_USERNAME`, `SPORTSCONNECT_PASSWORD` — Tim's Sports Connect (Stack Sports) admin login
 
 ### Gmail source for qbo_attach_file (optional)
 - `GMAIL_REFRESH_TOKENS` — JSON object mapping account email → OAuth refresh token (scope gmail.readonly). Mint with `npm run gmail:link` (requires the redirect URI, default `http://localhost:8766/callback`, to be allow-listed on the Google OAuth client). For Cloud Run, store as a Secret Manager secret and wire it in deploy.sh.

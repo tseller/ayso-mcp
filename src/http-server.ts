@@ -20,6 +20,8 @@ import { FirestoreOAuthStore } from "./oauth-store.js";
 import { createQboAuthRouter } from "./qbo-auth-callback.js";
 import { DivvyClient } from "./divvy-client.js";
 import { registerDivvyTools } from "./tools/divvy.js";
+import { registerSportsConnectTools } from "./tools/sportsconnect.js";
+import { sportsConnectClientFromEnv } from "./sportsconnect-client.js";
 import { IdempotencyStore } from "./idempotency.js";
 import { gmailClientFromEnv } from "./gmail-client.js";
 import {
@@ -73,6 +75,9 @@ export function startHttpServer(qboConfig?: QboConfig): void {
   const firestore = new FirestoreOAuthStore(gcpProjectId);
   const idempotency = new IdempotencyStore(firestore);
   const gmail = gmailClientFromEnv();
+  // One per process, like the QBO client: it holds the signed-in portal
+  // session, and the modern leg builds a server per request.
+  const sportsConnect = sportsConnectClientFromEnv();
 
   /**
    * One fresh server instance with every tool on it.
@@ -103,6 +108,10 @@ export function startHttpServer(qboConfig?: QboConfig): void {
     const divvyToken = process.env.DIVVY_API_TOKEN;
     if (divvyToken) {
       registerDivvyTools(server, new DivvyClient(divvyToken), { gmail });
+    }
+
+    if (sportsConnect) {
+      registerSportsConnectTools(server, sportsConnect);
     }
 
     return server;

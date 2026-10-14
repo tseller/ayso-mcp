@@ -1,7 +1,8 @@
 # mcp-billcom
 
 MCP (Model Context Protocol) server for the AYSO treasurer workflow, wrapping the
-**QuickBooks Online** Accounting API and **BILL Divvy / Spend & Expense**.
+**QuickBooks Online** Accounting API, **BILL Divvy / Spend & Expense**, and (read-only)
+**Sports Connect** registration orders.
 
 - Entry point: `src/index.ts` — registers QBO and/or Divvy tools based on available env vars.
 - Architecture, env vars, and deploy notes: see [`CLAUDE.md`](./CLAUDE.md).
@@ -20,6 +21,13 @@ All QBO tools operate on **already-posted** register entities:
 | Reports | `qbo_transaction_report`, `qbo_profit_loss`, `qbo_balance_sheet` |
 | Reconcile | `qbo_reconcile_worksheet`, `qbo_cleared_transactions` |
 | Attachments | `qbo_list_attachments`, `qbo_attach_file` |
+
+## Sports Connect tool surface (read-only)
+
+| Area | Tools |
+| --- | --- |
+| Orders | `sportsconnect_order_lookup` (by order id, player name or account name — status, balance, payments and refunds) |
+| Refunds | `sportsconnect_refunds_since` (every refund back to a card since a date) |
 
 ## Known limitation — the QBO "For-Review" bank feed is **not** API-accessible
 
