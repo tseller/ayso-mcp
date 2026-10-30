@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/server";
-import { QboClient, type QboClass } from "../qbo-client.js";
+import { QboClient, buildClassUpdate, type QboClass } from "../qbo-client.js";
 import { IdempotencyStore, withIdempotency } from "../idempotency.js";
 import { runTool } from "../tool-logging.js";
 
@@ -66,7 +66,7 @@ export function registerQboClassTools(
   server.registerTool(
     "qbo_create_class",
     {
-      description: "Create a QuickBooks Class (a season tag such as 'Fall 2026'). Safe to re-run: if a class with that name already exists it is returned instead of creating a near-duplicate, because QuickBooks happily accepts two classes with confusingly similar names and merging them afterwards is a manual chore in the web UI. Pass parentClassId to nest it under an existing class (e.g. seasons under a fiscal year).",
+      description: "Create a QuickBooks Class (a season tag such as 'Fall 2026'). Safe to re-run: if a class with that name already exists under the same parent (or at the top level, when no parent is given) it is returned instead of creating a near-duplicate, because QuickBooks happily accepts two classes with confusingly similar names and merging them afterwards is a manual chore in the web UI. Pass parentClassId to nest it under an existing class (e.g. seasons under a fiscal year).",
       inputSchema: z.object({
       name: z
         .string()
@@ -86,11 +86,13 @@ export function registerQboClassTools(
     },
     (args) =>
       runTool("qbo_create_class", args, async ({ name, parentClassId, idempotencyKey }) => {
-        const existing = await client.findClassByName(name);
+        const existing = await client.findClassInSlot(name, parentClassId);
         if (existing) {
           return {
             created: false,
-            reason: "a class with this name already exists",
+            reason: parentClassId
+              ? "a class with this name already exists under that parent"
+              : "a top-level class with this name already exists",
             class: shape(existing),
           };
         }
@@ -101,6 +103,34 @@ export function registerQboClassTools(
           : create())) as { Class?: QboClass };
 
         return { created: true, class: result.Class ? shape(result.Class) : result };
+      }),
+  );
+
+  server.registerTool(
+    "qbo_update_class",
+    {
+      description: "Rename a QuickBooks Class, move it under another class (or back to the top level), or (de)activate it. Every transaction already tagged with the class keeps the tag, so nesting e.g. 'Fall 2026' under 'Core' turns all its transactions into Core › Fall 2026 without re-tagging. Refuses a move that would collide with another class at the same name under the same parent, or nest a class under itself. Run with dryRun first.",
+      inputSchema: z.object({
+        classId: z.string().describe("Id of the class to change (from qbo_list_classes)"),
+        name: z.string().min(1).optional().describe("New name"),
+        parentClassId: z
+          .string()
+          .nullable()
+          .optional()
+          .describe("Class id to nest under, or null to move it to the top level"),
+        active: z.boolean().optional().describe("false deactivates the class, true reactivates it"),
+        dryRun: z.boolean().optional().describe("Show the before/after and write nothing (default false)"),
+      }),
+    },
+    (args) =>
+      runTool("qbo_update_class", args, async ({ classId, name, parentClassId, active, dryRun }) => {
+        const all = ((await client.listClasses(true)) as { QueryResponse?: { Class?: QboClass[] } })
+          .QueryResponse?.Class ?? [];
+        const existing = await client.getClass(classId);
+        const body = buildClassUpdate(existing, { name, parentClassId, active }, all);
+        if (dryRun) return { dryRun: true, before: shape(existing), after: shape(body) };
+        const result = (await client.updateClass(body)) as { Class?: QboClass };
+        return { updated: true, before: shape(existing), class: result.Class ? shape(result.Class) : result };
       }),
   );
 }
