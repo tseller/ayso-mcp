@@ -513,17 +513,16 @@ export class QboClient {
     return this.query(`SELECT * FROM Class ${where}MAXRESULTS ${maxResults}`);
   }
 
-  /** Look up a class by exact name (case-insensitive) — used to avoid creating duplicates. */
-  async findClassByName(name: string): Promise<QboClass | undefined> {
+  /**
+   * The class already sitting at this name under this parent, if any — used to
+   * avoid creating duplicates. "Fall 2026" at the top level and "Fall 2026"
+   * under "Core" are different classes, so the parent is part of the match.
+   */
+  async findClassInSlot(name: string, parentClassId?: string): Promise<QboClass | undefined> {
     const all = (await this.listClasses(true)) as {
       QueryResponse?: { Class?: QboClass[] };
     };
-    const target = name.trim().toLowerCase();
-    return (all.QueryResponse?.Class ?? []).find(
-      (c) =>
-        (c.Name ?? "").trim().toLowerCase() === target ||
-        (c.FullyQualifiedName ?? "").trim().toLowerCase() === target,
-    );
+    return findClassInSlot(all.QueryResponse?.Class ?? [], name, parentClassId);
   }
 
   async createClass(name: string, parentClassId?: string) {
@@ -532,6 +531,17 @@ export class QboClient {
       body.SubClass = true;
       body.ParentRef = { value: parentClassId };
     }
+    return this.request("POST", "/class", body);
+  }
+
+  async getClass(id: string): Promise<QboClass> {
+    const result = (await this.request("GET", `/class/${id}`)) as { Class?: QboClass };
+    if (!result.Class) throw new QboError(`Class ${id} not found`, 404, result);
+    return result.Class;
+  }
+
+  /** Full update: send the whole fetched class back with the changes applied. */
+  async updateClass(body: QboClass) {
     return this.request("POST", "/class", body);
   }
 
@@ -703,6 +713,73 @@ export interface QboClass {
   Active?: boolean;
   SubClass?: boolean;
   ParentRef?: { value?: string; name?: string };
+  SyncToken?: string;
+  [key: string]: unknown;
+}
+
+const sameName = (a: string | undefined, b: string) =>
+  (a ?? "").trim().toLowerCase() === b.trim().toLowerCase();
+
+/** The class with this name under this parent (no parent = top level), if one exists. */
+export function findClassInSlot(
+  classes: QboClass[],
+  name: string,
+  parentClassId?: string,
+): QboClass | undefined {
+  return classes.find(
+    (c) => sameName(c.Name, name) && (c.ParentRef?.value ?? undefined) === (parentClassId ?? undefined),
+  );
+}
+
+export interface ClassChanges {
+  name?: string;
+  /** A class id to nest under, or null to move the class to the top level. */
+  parentClassId?: string | null;
+  active?: boolean;
+}
+
+/**
+ * Apply renames / re-parenting / (de)activation to a fetched class. Refuses a
+ * change that would collide with another class in the destination slot or
+ * nest a class under itself or one of its own descendants.
+ */
+export function buildClassUpdate(
+  existing: QboClass,
+  changes: ClassChanges,
+  allClasses: QboClass[],
+): QboClass {
+  const body: QboClass = { ...existing };
+  delete body.FullyQualifiedName;
+  delete body.MetaData;
+  if (changes.name !== undefined) body.Name = changes.name;
+  if (changes.parentClassId !== undefined) {
+    if (changes.parentClassId === null) {
+      body.SubClass = false;
+      delete body.ParentRef;
+    } else {
+      const byId = new Map(allClasses.map((c) => [c.Id, c]));
+      for (let p: string | undefined = changes.parentClassId; p; p = byId.get(p)?.ParentRef?.value) {
+        if (p === existing.Id) {
+          throw new Error(`Class ${existing.Id} cannot be nested under itself or one of its own sub-classes`);
+        }
+      }
+      if (!byId.has(changes.parentClassId)) throw new Error(`Parent class ${changes.parentClassId} not found`);
+      body.SubClass = true;
+      body.ParentRef = { value: changes.parentClassId };
+    }
+  }
+  if (changes.active !== undefined) body.Active = changes.active;
+  const clash = findClassInSlot(
+    allClasses.filter((c) => c.Id !== existing.Id),
+    body.Name ?? "",
+    body.ParentRef?.value,
+  );
+  if (clash) {
+    throw new Error(
+      `Class ${clash.Id} "${clash.FullyQualifiedName ?? clash.Name}" already sits at that name under that parent`,
+    );
+  }
+  return body;
 }
 
 export interface QboPreferences {

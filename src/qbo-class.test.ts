@@ -7,7 +7,13 @@ import {
   onlyClassRefChanged,
   type QboLine,
 } from "./class-lines.js";
-import { parseClassLedger, parseProfitAndLossByClass } from "./qbo-client.js";
+import {
+  parseClassLedger,
+  parseProfitAndLossByClass,
+  findClassInSlot,
+  buildClassUpdate,
+  type QboClass,
+} from "./qbo-client.js";
 import { buildBudgetVsActuals, aggregateBudgetDetail, type QboBudget } from "./budget-actuals.js";
 import { buildPurchaseLineUpdate, buildDepositLineUpdate } from "./tools/qbo-transactions.js";
 import { buildClassTransactions } from "./tools/qbo-class-reports.js";
@@ -639,4 +645,52 @@ test("buildClassTransactions counts untagged across the whole period, not just t
   assert.equal(page.rowsInPeriod, 3);
   assert.equal(page.untaggedInPeriod, 1);
   assert.equal(page.rowCount, 1);
+});
+
+// --- Class slots: the same name under a different parent is a different class ---
+
+const classList = (): QboClass[] => [
+  { Id: "10", Name: "Core", FullyQualifiedName: "Core", Active: true, SubClass: false, SyncToken: "0" },
+  { Id: "11", Name: "Select", FullyQualifiedName: "Select", Active: true, SubClass: false, SyncToken: "0" },
+  { Id: "20", Name: "Fall 2026", FullyQualifiedName: "Fall 2026", Active: true, SubClass: false, SyncToken: "2" },
+  {
+    Id: "21",
+    Name: "Spring 2027",
+    FullyQualifiedName: "Select:Spring 2027",
+    Active: true,
+    SubClass: true,
+    ParentRef: { value: "11" },
+    SyncToken: "0",
+  },
+];
+
+test("findClassInSlot treats a top-level class as distinct from a same-named sub-class", () => {
+  assert.equal(findClassInSlot(classList(), "fall 2026")?.Id, "20");
+  assert.equal(findClassInSlot(classList(), "Fall 2026", "10"), undefined);
+  assert.equal(findClassInSlot(classList(), "Spring 2027", "11")?.Id, "21");
+  assert.equal(findClassInSlot(classList(), "Spring 2027"), undefined);
+});
+
+test("buildClassUpdate nests a class under a parent and keeps its SyncToken", () => {
+  const body = buildClassUpdate(classList()[2], { parentClassId: "10" }, classList());
+  assert.equal(body.SubClass, true);
+  assert.deepEqual(body.ParentRef, { value: "10" });
+  assert.equal(body.SyncToken, "2");
+  assert.equal(body.FullyQualifiedName, undefined);
+});
+
+test("buildClassUpdate moves a sub-class back to the top level", () => {
+  const body = buildClassUpdate(classList()[3], { parentClassId: null }, classList());
+  assert.equal(body.SubClass, false);
+  assert.equal(body.ParentRef, undefined);
+});
+
+test("buildClassUpdate refuses a move that lands on an existing class", () => {
+  const list = [...classList(), { Id: "22", Name: "Fall 2026", ParentRef: { value: "10" }, SubClass: true }];
+  assert.throws(() => buildClassUpdate(list[2], { parentClassId: "10" }, list), /already sits at that name/);
+});
+
+test("buildClassUpdate refuses to nest a class under itself or its own sub-class", () => {
+  assert.throws(() => buildClassUpdate(classList()[1], { parentClassId: "11" }, classList()), /under itself/);
+  assert.throws(() => buildClassUpdate(classList()[1], { parentClassId: "21" }, classList()), /under itself/);
 });
