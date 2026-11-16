@@ -238,8 +238,23 @@ export function diffPaths(before: unknown, after: unknown, path = ""): string[] 
   return out;
 }
 
+/**
+ * True when a `diffPaths` path lies at or INSIDE a ClassRef — the one place a
+ * class write may change anything.
+ *
+ * Inside matters: setting a class where there was none differs at
+ * `0.DepositLineDetail.ClassRef` (the key is new), but moving a line from one
+ * class to another keeps the key and differs at `…ClassRef.value` and
+ * `…ClassRef.name`. A test for "ends in ClassRef" refused the commonest
+ * re-tagging case as touching other fields (issue #73). This is the only copy
+ * of the rule; the write tools' self-check and `onlyClassRefChanged` both ask it.
+ */
+export function isClassRefPath(path: string): boolean {
+  return path.split(".").includes("ClassRef");
+}
+
 /** True when every difference is a ClassRef — i.e. no line data was disturbed. */
 export function onlyClassRefChanged(before: unknown, after: unknown): boolean {
   const paths = diffPaths(before, after);
-  return paths.length > 0 && paths.every((p) => p === "ClassRef" || p.endsWith(".ClassRef"));
+  return paths.length > 0 && paths.every(isClassRefPath);
 }

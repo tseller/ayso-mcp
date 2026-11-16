@@ -4,10 +4,12 @@ import { QboClient, QboError } from "../qbo-client.js";
 import {
   applyClassToLines,
   diffPaths,
+  isClassRefPath,
   type ClassableEntity,
   type QboLine,
 } from "../class-lines.js";
 import { runTool, ToolFailure } from "../tool-logging.js";
+import { buildClassWriteCard, lineClassNames, type WriteCard } from "../class-write-card.js";
 
 /**
  * Writing a Class onto existing transactions — the bulk re-tagging path.
@@ -51,7 +53,32 @@ interface SetClassOutcome {
   changed: Array<{ lineId: string; from: string | null; to: string | null }>;
   skipped: Array<{ lineId: string; reason: string }>;
   diffPaths: string[];
+  /** Dry run only: the same answer as an approval card (`write-card/1`), by name. */
+  card?: WriteCard;
   result?: unknown;
+}
+
+/**
+ * Class id → name for every class a card mentions. A line's current class
+ * carries its name on QBO's own ClassRef; anything else (the target) is read
+ * back from QBO. A class that cannot be read stays unnamed — the card then
+ * says `class <id>` rather than guessing.
+ */
+async function classNamesFor(client: QboClient, lines: QboLine[], ids: Array<string | null>) {
+  const names = lineClassNames(lines);
+  const missing = [...new Set(ids)].filter((i): i is string => i !== null && !names.has(i));
+  await Promise.all(
+    missing.map(async (classId) => {
+      try {
+        const c = await client.getClass(classId);
+        const n = c.FullyQualifiedName ?? c.Name;
+        if (n) names.set(classId, n);
+      } catch {
+        // unnamed is the honest answer
+      }
+    }),
+  );
+  return names;
 }
 
 export async function setTransactionClass(
@@ -64,6 +91,8 @@ export async function setTransactionClass(
     lineIds?: string[];
     expectedSyncToken?: string;
     dryRun?: boolean;
+    /** Attach the approval card to a dry run (default true; the batch tool opts out). */
+    card?: boolean;
   },
 ): Promise<SetClassOutcome> {
   const { entityType, id, lineIds, expectedSyncToken, dryRun = false } = args;
@@ -93,7 +122,7 @@ export async function setTransactionClass(
   // ClassRef. If anything else moved, that is a bug in this code path and we
   // refuse to write rather than damage the books.
   const differing = diffPaths(originalLines, lines);
-  const offending = differing.filter((p) => p !== "ClassRef" && !p.endsWith(".ClassRef"));
+  const offending = differing.filter((p) => !isClassRefPath(p));
   if (offending.length) {
     throw new QboError(
       `Refusing to write: the update would change fields other than ClassRef (${offending.join(", ")}). ` +
@@ -116,6 +145,16 @@ export async function setTransactionClass(
     diffPaths: differing,
   };
 
+  if (dryRun && args.card !== false) {
+    const ids = changed.flatMap((c) => [c.from, c.to]);
+    outcome.card = buildClassWriteCard({
+      entityType,
+      id,
+      record: existing,
+      changed: outcome.changed,
+      classNames: await classNamesFor(client, originalLines, [...ids, classId]),
+    });
+  }
   if (dryRun || changed.length === 0) return outcome;
 
   const update: Record<string, unknown> = {
@@ -159,7 +198,7 @@ export function registerQboClassWriteTools(server: McpServer, client: QboClient)
   server.registerTool(
     "qbo_set_transaction_class",
     {
-      description: `Set (or clear) the Class on one existing transaction — a purchase, deposit or journal entry. ${SHARED_DESC} Use dryRun first to see exactly which lines would change.`,
+      description: `Set (or clear) the Class on one existing transaction — a purchase, deposit or journal entry. ${SHARED_DESC} Use dryRun first to see exactly which lines would change; a dry run also answers \`card\`, the same change as an approval card (contract write-card/1): who, how much, and each line's class from → to by name.`,
       inputSchema: z.object({
       entityType: ENTITY_ENUM.describe("Which kind of transaction (from the list/get tools)"),
       id: z.string().describe("Transaction id"),
@@ -241,7 +280,7 @@ export function registerQboClassWriteTools(server: McpServer, client: QboClient)
           continue;
         }
         try {
-          const outcome = await setTransactionClass(client, { ...item, dryRun });
+          const outcome = await setTransactionClass(client, { ...item, dryRun, card: false });
           results.push({ index, ok: true, ...outcome, result: undefined });
         } catch (e) {
           results.push({
