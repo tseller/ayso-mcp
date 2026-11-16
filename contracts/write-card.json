@@ -1,0 +1,195 @@
+{
+  "contract": "write-card/1",
+  "about": "The approval card air control raises when a pilot’s write is held for a human. A server whose write tool takes a boolean `dryRun` is asked for a preview first (the same call, dryRun:true); it may answer with `preview` below, and the card then shows the server’s own before → after instead of flightdeck’s derivation. Answering with anything else falls back, and the card says so.",
+  "preview": {
+    "$id": "https://github.com/tseller/flightdeck/blob/main/contracts/write-card.json#preview",
+    "type": "object",
+    "required": [
+      "contract",
+      "fields"
+    ],
+    "properties": {
+      "contract": {
+        "const": "write-card/1"
+      },
+      "summary": {
+        "type": "string",
+        "maxLength": 200,
+        "description": "one plain sentence a human judges the write by — \"Change the class on deposit #1131 — $484.40 from …\""
+      },
+      "fields": {
+        "type": "array",
+        "maxItems": 14,
+        "items": {
+          "type": "object",
+          "required": [
+            "label",
+            "value"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "label": {
+              "type": "string",
+              "maxLength": 40,
+              "description": "what the value is — \"Amount\", \"Class (line 1, $484.40)\""
+            },
+            "value": {
+              "type": "string",
+              "maxLength": 240,
+              "description": "what it reads once the write has run (for an unchanged field, what it reads now)"
+            },
+            "from": {
+              "type": "string",
+              "maxLength": 240,
+              "description": "CHANGED fields only: what it reads now, before the write"
+            },
+            "changed": {
+              "type": "boolean",
+              "description": "true when this write changes the field; the card highlights it as from → value"
+            }
+          }
+        },
+        "description": "the record before → after, in the order a bookkeeper reads it"
+      },
+      "link": {
+        "type": "string",
+        "pattern": "^https://",
+        "description": "the record's own page in the server's product"
+      }
+    }
+  },
+  "card": {
+    "$id": "https://github.com/tseller/flightdeck/blob/main/contracts/write-card.json#card",
+    "type": "object",
+    "required": [
+      "kind",
+      "question",
+      "why",
+      "fields",
+      "options"
+    ],
+    "properties": {
+      "kind": {
+        "const": "clearance",
+        "description": "routes the verdict to /flight-clearance"
+      },
+      "billing": {
+        "type": "boolean",
+        "description": "true only for a paid-billing card (#2129), which is drawn differently"
+      },
+      "recommend": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "the option to mark recommended, or null — a card nobody can read is never recommended"
+      },
+      "question": {
+        "type": "string",
+        "maxLength": 200,
+        "description": "the headline: what the write will do, in one sentence"
+      },
+      "why": {
+        "type": "string",
+        "maxLength": 300,
+        "description": "the pilot's own reason, the record's memo, or a plain admission that there is none"
+      },
+      "fields": {
+        "type": "array",
+        "maxItems": 14,
+        "items": {
+          "type": "object",
+          "required": [
+            "label",
+            "value"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "label": {
+              "type": "string",
+              "maxLength": 40,
+              "description": "what the value is — \"Amount\", \"Class (line 1, $484.40)\""
+            },
+            "value": {
+              "type": "string",
+              "maxLength": 240,
+              "description": "what it reads once the write has run (for an unchanged field, what it reads now)"
+            },
+            "from": {
+              "type": "string",
+              "maxLength": 240,
+              "description": "CHANGED fields only: what it reads now, before the write"
+            },
+            "changed": {
+              "type": "boolean",
+              "description": "true when this write changes the field; the card highlights it as from → value"
+            }
+          }
+        }
+      },
+      "link": {
+        "type": "string",
+        "description": "https link to the record, or ''"
+      },
+      "note": {
+        "type": "string",
+        "description": "facts about the CARD itself — which tool is held, whose preview this is, what could not be read"
+      },
+      "check": {
+        "type": "string"
+      },
+      "meter": {
+        "type": "string"
+      },
+      "options": {
+        "type": "array",
+        "minItems": 2,
+        "maxItems": 2,
+        "items": {
+          "type": "object",
+          "required": [
+            "value",
+            "label",
+            "what"
+          ],
+          "properties": {
+            "value": {
+              "enum": [
+                "cleared",
+                "sent-back"
+              ]
+            },
+            "label": {
+              "type": "string"
+            },
+            "what": {
+              "type": "string",
+              "description": "what pressing it does to THIS record"
+            }
+          }
+        }
+      }
+    }
+  },
+  "example": {
+    "contract": "write-card/1",
+    "summary": "Change the class on deposit #1131 — $484.40 from Blue Sombrero Sports Connect into Chase Checking on Aug 19, 2026",
+    "fields": [
+      {
+        "label": "Received from",
+        "value": "Blue Sombrero Sports Connect"
+      },
+      {
+        "label": "Amount",
+        "value": "$484.40"
+      },
+      {
+        "label": "Class",
+        "value": "Core:Fall 2026",
+        "from": "Core",
+        "changed": true
+      }
+    ],
+    "link": "https://app.qbo.intuit.com/app/deposit?txnId=1131"
+  }
+}
