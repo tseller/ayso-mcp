@@ -6,6 +6,7 @@ import { IdempotencyStore, withIdempotency } from "../idempotency.js";
 import type { GmailClient } from "../gmail-client.js";
 import { mergeLinePatches, type LineFieldPatch, type QboLine } from "../class-lines.js";
 import { runTool, ToolFailure } from "../tool-logging.js";
+import { buildAttachmentPreview, MAX_PREVIEW_BYTES, type AttachableLike } from "../attachment-preview.js";
 import {
   buildEntityList,
   queryRows,
@@ -805,6 +806,22 @@ export function registerQboTransactionTools(
           createdAt: a.MetaData?.CreateTime,
         }));
         return { count: attachments.length, attachments };
+      }),
+  );
+
+  server.registerTool(
+    "qbo_get_attachment_preview",
+    {
+      description: `Get a preview of one file attached to a QuickBooks record (attachableId from qbo_list_attachments). For an image, returns a small thumbnail inline as a data: URI (preview.dataUri, at most ${MAX_PREVIEW_BYTES} bytes) so it can be shown without a link that expires. For any file, returns download.url — QBO's short-lived signed link to the whole file — with download.expiresAt read from the link itself. A PDF or other document has no preview; previewOmitted says why.`,
+      inputSchema: z.object({
+        attachableId: z.string().describe("The Attachable id (from qbo_list_attachments)"),
+      }),
+    },
+    (args) =>
+      runTool("qbo_get_attachment_preview", args, async ({ attachableId }) => {
+        const result = (await client.getAttachable(attachableId)) as { Attachable?: AttachableLike };
+        if (!result.Attachable) throw new Error(`QBO returned no Attachable for id ${attachableId}`);
+        return buildAttachmentPreview(result.Attachable);
       }),
   );
 }
