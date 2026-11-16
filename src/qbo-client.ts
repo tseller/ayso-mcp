@@ -632,6 +632,11 @@ export class QboClient {
     }
     return report;
   }
+  /** One Attachable, including QBO's short-lived signed download/thumbnail links. */
+  async getAttachable(id: string) {
+    return this.request("GET", `/attachable/${encodeURIComponent(id)}`);
+  }
+
   async queryAttachables(entityType: string, entityId: string) {
     return this.query(
       `SELECT * FROM attachable WHERE AttachableRef.EntityRef.Type = '${entityType}' AND AttachableRef.EntityRef.value = '${entityId}'`,
