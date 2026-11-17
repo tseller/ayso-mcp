@@ -5,6 +5,8 @@
  * accounting entities a nonprofit treasurer needs most.
  */
 
+import { QBO_RECORDS, type QboRecordKind } from "./qbo-records.js";
+
 export class QboError extends Error {
   constructor(
     message: string,
@@ -447,7 +449,12 @@ export class QboClient {
   }
 
   async getPurchase(id: string) {
-    return this.request("GET", `/purchase/${id}`);
+    return this.getRecord("Purchase", id);
+  }
+
+  /** Read one record of any kind in QBO_RECORDS (src/qbo-records.ts) by id. */
+  async getRecord(kind: QboRecordKind, id: string) {
+    return this.request("GET", `/${QBO_RECORDS[kind].path}/${encodeURIComponent(id)}`);
   }
 
   async updatePurchase(purchase: Record<string, unknown>) {
@@ -466,7 +473,7 @@ export class QboClient {
   }
 
   async getDeposit(id: string) {
-    return this.request("GET", `/deposit/${id}`);
+    return this.getRecord("Deposit", id);
   }
 
   async createDeposit(deposit: Record<string, unknown>) {
@@ -493,7 +500,7 @@ export class QboClient {
   }
 
   async getJournalEntry(id: string) {
-    return this.request("GET", `/journalentry/${id}`);
+    return this.getRecord("JournalEntry", id);
   }
 
   async updateJournalEntry(journalEntry: Record<string, unknown>) {

@@ -15,6 +15,7 @@ import {
   slimTransfer,
 } from "../qbo-rows.js";
 import { LIST_PAGING, LIST_PAGING_DOC, LIST_PAGING_NARROWING } from "./list-paging.js";
+import { QBO_RECORDS, QBO_RECORD_KINDS } from "../qbo-records.js";
 
 const CLASS_ID_DESC =
   "Optional Class id (the season tag, from qbo_list_classes) for this line. This company tracks one class per LINE, so it goes here rather than on the transaction.";
@@ -159,6 +160,17 @@ export function registerQboTransactionTools(
     return withIdempotency(idempotency, tool, key, create);
   }
 
+  // One read-only get tool per kind of record a tool can name by id, so a kind
+  // qbo_attach_file accepts can always be read back (#76).
+  for (const kind of QBO_RECORD_KINDS) {
+    const { tool, description, idDesc } = QBO_RECORDS[kind];
+    server.registerTool(
+      tool,
+      { description, inputSchema: z.object({ id: z.string().describe(idDesc) }) },
+      (args) => runTool(tool, args, ({ id }) => client.getRecord(kind, id)),
+    );
+  }
+
   server.registerTool(
     "qbo_list_purchases",
     {
@@ -204,16 +216,6 @@ export function registerQboTransactionTools(
       ),
   );
 
-  server.registerTool(
-    "qbo_get_purchase",
-    {
-      description: "Get a single purchase/expense transaction by ID. Returns full details including line items.",
-      inputSchema: z.object({
-      id: z.string().describe("Purchase transaction ID"),
-    }),
-    },
-    (args) => runTool("qbo_get_purchase", args, ({ id }) => client.getPurchase(id)),
-  );
 
   server.registerTool(
     "qbo_update_purchase",
@@ -382,16 +384,6 @@ export function registerQboTransactionTools(
       ),
   );
 
-  server.registerTool(
-    "qbo_get_deposit",
-    {
-      description: "Get a single deposit transaction by ID. Returns full details including line items and SyncToken (needed for update_deposit).",
-      inputSchema: z.object({
-      id: z.string().describe("Deposit transaction ID"),
-    }),
-    },
-    (args) => runTool("qbo_get_deposit", args, ({ id }) => client.getDeposit(id)),
-  );
 
   const depositLineSchema = z.object({
     amount: z.number().describe("Line amount (positive)"),
@@ -732,7 +724,7 @@ export function registerQboTransactionTools(
       description: "Attach a file (receipt, invoice, supporting doc) to a QuickBooks transaction. " + FILE_SOURCE_DOC + " Returns the created Attachable id and filename. Provide the transaction's entity type (e.g. Purchase, Deposit, Bill, Transfer) and its Id (from the list/get tools).",
       inputSchema: z.object({
       entityType: z
-        .enum(["Purchase", "Deposit", "Bill", "Transfer", "Invoice", "JournalEntry", "VendorCredit"])
+        .enum(QBO_RECORD_KINDS)
         .describe("QBO entity type of the transaction to attach to"),
       entityId: z.string().describe("Transaction Id (the entity's Id, from list/get tools)"),
       ...FILE_SOURCE,
@@ -778,7 +770,7 @@ export function registerQboTransactionTools(
       description: "List the files already attached to a QuickBooks transaction — use before qbo_attach_file to avoid duplicate uploads. Returns each attachment's Attachable id, filename, size, and content type.",
       inputSchema: z.object({
       entityType: z
-        .enum(["Purchase", "Deposit", "Bill", "Transfer", "Invoice", "JournalEntry", "VendorCredit"])
+        .enum(QBO_RECORD_KINDS)
         .describe("QBO entity type of the transaction"),
       entityId: z.string().describe("Transaction Id (the entity's Id, from list/get tools)"),
     }),
