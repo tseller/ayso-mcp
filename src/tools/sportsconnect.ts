@@ -365,7 +365,7 @@ export function registerSportsConnectTools(server: McpServer, client: SportsConn
         for (const g of found) {
           for (const p of g.problems) {
             const kind = p.startsWith("risk status")
-              ? p.match(/^risk status \S+/)![0]
+              ? p.match(/^risk status \w+/)![0]
               : p.includes(" holds ")
                 ? "coaching licence below the division's age"
                 : p.includes("8U Official")
