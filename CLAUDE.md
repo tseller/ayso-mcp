@@ -69,7 +69,10 @@ gcloud config configurations activate mcp-billcom
 - `src/sportsconnect-client.ts` — Sports Connect (Stack Sports / Blue Sombrero) admin access for Millbrae AYSO's portal, **read-only by construction** (`READ_ENDPOINTS`) and **browserless** — see "Sports Connect" below
 - `src/sportsconnect-orders.ts` — reading an order from the model its view page embeds, finding orders by name, and finding refunds since a date
 - `src/sportsconnect-enrollment.ts` — enrollment by program and division, and one division's players: one read of the Enrollment Details report plus the wait list from the Line Item Order report, and one rule for what counts as enrolled — see "Enrollment" under "Sports Connect" below
-- `src/tools/sportsconnect.ts` — Sports Connect: order_lookup, refunds_since, enrollment_counts, division_roster
+- `src/sportsconnect-volunteers.ts` — volunteers from the All Volunteers report, the rules for whether a volunteer is cleared and certified for their role (`problemsOf`: AYSO's risk colour key, coach licence vs division age, referee grade), and team staffing joined to where the players are — see "Volunteers, staffing, unpaid and history" under "Sports Connect" below
+- `src/sportsconnect-history.ts` — a player's registrations across every season, from the Line Item Order report
+- `src/tools/sportsconnect.ts` — Sports Connect: order_lookup, refunds_since, enrollment_counts, division_roster, volunteers, team_staffing, volunteer_gaps, unpaid, player_history. All declared `read` in `TOOL_ACCESS`, so a viewer (Laura) is offered every one
+- `docs/playmetrics.md` — what PlayMetrics lets an outside tool reach (no official API; the web app's Firebase-signed API), written before anything was built (#79)
 - `src/protocol-version.ts` — legacy-era protocol-version negotiation + header reconciliation (see "Protocol version" below)
 - `src/era-routing.ts` — which leg of `/mcp` serves a request: the SDK's `classifyInboundRequest`, plus the one rule that goes in front of it (an `Mcp-Session-Id` means legacy, always). See "Protocol eras" below
 - `src/discover.ts` — what the modern leg advertises, read by **asking** the modern leg rather than restating it beside it. No protocol revision is hard-coded in this repo; a test greps for one
@@ -986,6 +989,57 @@ depends on who they are.
 - `X-Treasurer-Access: viewer` on a full caller's request serves the viewer's
   server — how the treasurer previews exactly what a viewer sees. It only
   narrows.
+
+### Volunteers, staffing, unpaid and history
+
+`sportsconnect_volunteers`, `sportsconnect_team_staffing`,
+`sportsconnect_volunteer_gaps`, `sportsconnect_unpaid` and
+`sportsconnect_player_history` answer the everyday region questions (#79).
+They are built on the report wizard's reports; each model's columns are
+`GET reporting.bluesombrero.com/proxy/reporting/api/v1/DynamicQuery/<reportKey>`
+(keyed by the **reportKey**, not the modelId — the modelId answers
+`attributes: null`). The report keys this login can run include
+`ReportWizardAllVolunteersNewRegistration`,
+`ReportWizardVolunteerVerificationStatusNewRegistration`,
+`ReportWizardOpenOrdersNewRegistration`,
+`ReportWizardDivisionDetailsNewRegistration` and
+`ReportWizardWaitListNewRegistration`.
+
+Traps worth knowing (probed live 2026-11-20):
+
+- **A column a model does not have is a bare HTTP 500**, not an error naming
+  it (`PlayersDateOfBirth` on Line Item Order). Check the model first.
+- **All Volunteers is one row per role**, not per person, and holds the
+  current membership year only: asked for any earlier program it returns 0
+  rows. Volunteer history is not readable; player history is.
+- **Training is AYSO's, as Sports Connect holds it**: `CoachingLicenseLevel`
+  (`6U Coach` … `Advanced (19U) Coach`) and `RefereeGrade`. The courses behind
+  them (Safe Haven, concussion, cardiac arrest, SafeSport) are in no report
+  this login can run, so the tools judge only whether the licence or grade on
+  file covers the job — a coach's licence age must be at least the division's.
+- **`RiskStatus` is AYSO's background-check colour** (AYSO wiki, Volunteer
+  Status Risk Color Key): Green any position; Blue a youth volunteer (referee
+  or supervised only — a gap if registered as a coach); Expired, None (no
+  consent form), Yellow, Orange, Brown, Red are not cleared.
+- **Team staffing starts from the players' teams** (Enrollment Details), so a
+  team with players and no volunteers still appears; on the live books every
+  volunteer's team matched an enrolled team by division and name.
+- **Unpaid is read from the same collapsed enrollment rows** as the counts. A
+  cancelled registration keeps a `OrderDetailsBalanceItemAmount` that nobody
+  owes (9 line items, $2,379.50, on the live books) and is never listed; a
+  declined card is its own `Failed` order, and a family that retried and paid
+  is enrolled, not declined.
+- **Line Item Order reaches back to 2017**, but a last-name `Contains` walks
+  every season: ~45s for a common surname.
+
+Live portal, 2026-11-20 (local run against the live portal): 267 volunteer
+roles (76 referees, 69 assistant coaches, 44 head coaches); 52 teams, 13 with
+no head coach and 34 with no referee registered to the team; 91 roles with a
+gap, the largest being 28 referees with no grade on file and 21 assistant
+coaches with no licence; nobody enrolled owes money and one player's only
+attempt was declined; player history for a common surname is 37 players over
+18 programs since 2017 in 45s. The unfiltered volunteer list pages (180 of
+267 rows in the first 38.8k-char page).
 
 ## Environment Variables
 

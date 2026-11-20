@@ -110,6 +110,11 @@ export const TOOL_ACCESS: Record<string, ToolKind> = {
   sportsconnect_refunds_since: "read",
   sportsconnect_enrollment_counts: "read",
   sportsconnect_division_roster: "read",
+  sportsconnect_volunteers: "read",
+  sportsconnect_team_staffing: "read",
+  sportsconnect_volunteer_gaps: "read",
+  sportsconnect_unpaid: "read",
+  sportsconnect_player_history: "read",
 
   // Who may see the books — the treasurer's alone
   access_list_viewers: "write",
