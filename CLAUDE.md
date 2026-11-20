@@ -35,10 +35,12 @@ gcloud config configurations activate mcp-billcom
 ## Architecture
 
 - **ESM project** using TypeScript with Node16 module resolution
+- `src/tool-registry.ts` — the one tool list both transports build from (`registerAllTools`), and `TOOL_ACCESS`, every tool declared `read` or `write`. A viewer's server registers only reads — see "Read-only access" below
+- `src/access.ts` — who the caller is and what they may do, decided per request: `ALLOWED_EMAILS` (and `MCP_API_TOKEN`) are the treasurer; viewer grants live in Firestore (`access/viewers`). `src/tools/access.ts` is the treasurer's `access_list_viewers` / `access_grant_viewer` / `access_revoke_viewer`
 - `src/index.ts` — entry point: registers QBO and/or Divvy tools based on available env vars. The stdio path goes through `serveStdio` rather than a hand-connected `StdioServerTransport`, so stdio serves both protocol eras too — see "Protocol eras" below
 - `src/qbo-client.ts` — QuickBooks Online API client with OAuth2 token refresh (rolling refresh tokens)
 - `src/oauth.ts` — OAuth2 server (Google-backed) for MCP HTTP auth
-- `src/http-server.ts` — the Cloud Run deployment's `/mcp`: the sessionful legacy Streamable HTTP transport, the per-request modern handler, and the `/health` both are reported on. `buildServer()` here is the single tool-registration list both eras build from — see "Protocol eras" below
+- `src/http-server.ts` — the Cloud Run deployment's `/mcp` (`buildHttpApp` builds it without listening, so tests drive the real app): the sessionful legacy Streamable HTTP transport, the per-request modern handler, and the `/health` both are reported on. `buildServer()` here is the single tool-registration list both eras build from — see "Protocol eras" below
 - `src/tools/qbo-accounts.ts` — QBO: list_accounts (flattened rows + paging), account_balances
 - `src/tools/qbo-vendors.ts` — QBO: list_vendors, search_vendors (both flattened rows + paging), create_vendor
 - `src/tools/list-paging.ts` — the paging vocabularies, each paired with the sentence that names its knobs when a result is over budget (so advice and schema can't drift): `listPaging(defaultMaxResults)` (`startPosition`/`maxResults`/`format`, the QBO entity queries), `OFFSET_PAGING_NARROWING` (the `offset`/`limit` report tools) and `cursorPaging(limits)` (`page`/`pageSize`/`format`, BILL's opaque cursor — the `pageSize` bound comes from `src/divvy-paging.ts` rather than being restated here)
@@ -958,6 +960,32 @@ Live portal, 2026-10-14: 556 enrolled (555 in the Fall CORE program, one
 volunteer), 9 wait-listed (8 in 14U Boys, which is 21 enrolled against a cap of
 18), counts in ~6s and 2.6k chars; the 10U Girls roster is 34 players, 10.3k
 chars.
+
+## Read-only access
+
+Laura (regional commissioner) needs to see the books, and the treasurer's
+connector can change them (#78). So access is a property of the **caller**, not
+of a second deployment: one URL, one sign-in, and the server a caller is given
+depends on who they are.
+
+- `full` — `MCP_API_TOKEN`, or a Google sign-in in `ALLOWED_EMAILS`.
+- `viewer` — a Google sign-in the treasurer granted with `access_grant_viewer`.
+  Their server (`treasurer-mcp-readonly`) registers only the tools
+  `TOOL_ACCESS` declares `read`, each marked `readOnlyHint: true`. A write is
+  not merely hidden: the viewer's server has no such tool, so `tools/call`
+  for it is answered with an error before any handler runs, on both eras.
+- Every tool must be declared in `TOOL_ACCESS`; `access.test.ts` fails by name
+  for one that is not, and an undeclared tool is treated as a write meanwhile.
+- Access is looked up on **every request** (and on every refresh-token use),
+  never stamped onto a token. So `access_revoke_viewer` is the whole of turning
+  someone off: their next request — even on a session already open — is a 403,
+  and their sign-in cannot be refreshed.
+- A legacy session remembers who opened it and with what access; a request on
+  it from anyone else is refused rather than served by a server built for
+  someone they are not.
+- `X-Treasurer-Access: viewer` on a full caller's request serves the viewer's
+  server — how the treasurer previews exactly what a viewer sees. It only
+  narrows.
 
 ## Environment Variables
 

@@ -2,6 +2,7 @@ import { randomUUID, createHash } from "node:crypto";
 import express, { Router } from "express";
 import type { Request, Response, NextFunction } from "express";
 import type { OAuthStore } from "./oauth-store.js";
+import { ACCESS_HEADER, narrow, type AccessStore, type Caller } from "./access.js";
 
 // --- Types ---
 
@@ -102,7 +103,7 @@ async function exchangeGoogleCode(
 
 // --- Router factory ---
 
-export function createOAuthRouter(config: OAuthConfig, store: OAuthStore): Router {
+export function createOAuthRouter(config: OAuthConfig, store: OAuthStore, access: AccessStore): Router {
   const router = Router();
 
   // Parse URL-encoded bodies (OAuth token requests use application/x-www-form-urlencoded)
@@ -239,13 +240,14 @@ export function createOAuthRouter(config: OAuthConfig, store: OAuthStore): Route
 
       console.error(`[oauth] Google auth successful for: ${email}`);
 
-      // Check allowlist if configured (ALLOWED_EMAILS=a@x.com,b@x.com)
-      const allowedEmails = process.env.ALLOWED_EMAILS?.split(",").map((e) => e.trim());
-      if (allowedEmails && !allowedEmails.includes(email)) {
-        console.error(`[oauth] Rejected: ${email} not in ALLOWED_EMAILS`);
+      // The treasurer (ALLOWED_EMAILS) or a granted viewer — see access.ts.
+      const granted = await access.accessFor(email);
+      if (!granted) {
+        console.error(`[oauth] Rejected: ${email} is neither in ALLOWED_EMAILS nor a granted viewer`);
         res.status(403).send("Access denied");
         return;
       }
+      console.error(`[oauth] ${email} signs in with ${granted} access`);
 
       // Generate our own auth code
       const ourCode = randomUUID();
@@ -346,6 +348,13 @@ export function createOAuthRouter(config: OAuthConfig, store: OAuthStore): Route
         res.status(400).json({ error: "invalid_grant", error_description: "Invalid refresh token" });
         return;
       }
+      // A refresh token outlives any one grant, so access is asked again here:
+      // a revoked viewer cannot mint another hour.
+      if (!(await access.accessFor(stored.googleEmail))) {
+        console.error(`[oauth] Refresh refused: ${stored.googleEmail} no longer has access`);
+        res.status(400).json({ error: "invalid_grant", error_description: "Access has been revoked" });
+        return;
+      }
 
       const accessToken = randomUUID();
       const expiresIn = 3600;
@@ -373,7 +382,12 @@ export function createOAuthRouter(config: OAuthConfig, store: OAuthStore): Route
 
 // --- Auth middleware for /mcp ---
 
-export function createRequireAuth(store: OAuthStore) {
+/**
+ * Bearer check plus access: on success `res.locals.caller` says who is calling
+ * and with what access, decided now rather than when the token was issued, so
+ * a revoked viewer is refused on their next request (see access.ts).
+ */
+export function createRequireAuth(store: OAuthStore, access: AccessStore) {
   return async function requireAuth(
     req: Request,
     res: Response,
@@ -386,10 +400,12 @@ export function createRequireAuth(store: OAuthStore) {
     }
 
     const token = authHeader.slice(7);
+    const asked = req.headers[ACCESS_HEADER];
 
     // Static API token for trusted agents (bypasses OAuth)
     const apiToken = process.env.MCP_API_TOKEN;
     if (apiToken && token === apiToken) {
+      res.locals.caller = { who: "api-token", access: narrow("full", asked) } satisfies Caller;
       next();
       return;
     }
@@ -400,6 +416,14 @@ export function createRequireAuth(store: OAuthStore) {
       return;
     }
 
+    const granted = await access.accessFor(stored.googleEmail);
+    if (!granted) {
+      res.locals.refusalReason = `access revoked for ${stored.googleEmail}`;
+      res.status(403).json({ error: "Forbidden", error_description: "This account no longer has access" });
+      return;
+    }
+
+    res.locals.caller = { who: stored.googleEmail, access: narrow(granted, asked) } satisfies Caller;
     next();
   };
 }
