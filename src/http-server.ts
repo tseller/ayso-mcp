@@ -254,7 +254,13 @@ export function buildHttpApp(deps: HttpAppDeps = {}): { app: express.Express; sh
       if (route.reason === "malformed-modern") {
         res.locals.refusalReason = `modern claim rejected at ${route.rung} (${route.cell})`;
       }
-      await modernNodes[callerOf(res).access](req, res, req.body);
+      const caller = callerOf(res);
+      // The modern era has no session line to say who called, so this does.
+      console.error(
+        `[http] modern ${(req.body as { method?: string } | undefined)?.method ?? "-"}` +
+          ` access=${caller.access} who=${caller.who}`,
+      );
+      await modernNodes[caller.access](req, res, req.body);
       return;
     }
 
@@ -403,7 +409,7 @@ export function buildHttpApp(deps: HttpAppDeps = {}): { app: express.Express; sh
         negotiatedVersions.set(sessionId, negotiated);
         sessionCallers.set(sessionId, caller);
         console.error(
-          `[http] New session: ${sessionId} protocolVersion=${negotiated} access=${caller.access}`,
+          `[http] New session: ${sessionId} protocolVersion=${negotiated} access=${caller.access} who=${caller.who}`,
         );
       },
     });
