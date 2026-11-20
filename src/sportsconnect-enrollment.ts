@@ -70,6 +70,7 @@ const COLUMNS = [
   "OrdersOrderId",
   "OrdersOrderDate",
   "OrdersPaymentStatus",
+  "OrderDetailsBalanceItemAmount",
   "PlayersPlayerId",
   "PlayersFirstName",
   "PlayersLastName",
@@ -124,6 +125,8 @@ export interface Enrollment {
   orderId: string;
   orderDate: string | null;
   state: EnrollmentState;
+  /** What is still owed on this registration's line item; 0 when paid in full. */
+  balance: number;
   account: string | null;
   email: string | null;
   phone: string | null;
@@ -175,6 +178,7 @@ export function collapse(rows: Row[]): Omit<EnrollmentRead, "capped" | "totalRec
       orderId: r.OrdersOrderId ?? "",
       orderDate: reportDate(r.OrdersOrderDate),
       state,
+      balance: Number(r.OrderDetailsBalanceItemAmount ?? 0) || 0,
       account: join(blank(r.UsersFirstName), blank(r.UsersLastName)),
       email: blank(r.UsersEmail),
       phone: blank(r.UsersCellPhone),
@@ -256,6 +260,7 @@ export async function readWaitList(
         PlayersGender: null,
         PlayersDateOfBirth: null,
         TeamsTeamName: null,
+        OrderDetailsBalanceItemAmount: null,
         waitListed: true,
       } as Row);
     }
@@ -390,6 +395,8 @@ export function allDivisions(enrollments: Enrollment[]): string[] {
 
 export interface RosterRow {
   player: string;
+  /** Owed on the registration; present only when something is. */
+  balance?: number;
   playerId: string;
   gender: string | null;
   birthDate: string | null;
@@ -416,6 +423,7 @@ export function roster(
       birthDate: e.birthDate,
       team: e.team,
       status: e.state,
+      ...(e.balance > 0 && isLive(e) ? { balance: e.balance } : {}),
       orderId: e.orderId,
       orderDate: e.orderDate,
       account: e.account,
@@ -428,4 +436,35 @@ export function roster(
         (a.team ?? "").localeCompare(b.team ?? "", "en", { numeric: true }) ||
         a.player.localeCompare(b.player),
     );
+}
+
+// ---------------------------------------------------------------------------
+// Who has not paid
+
+export interface Unpaid {
+  /** Enrolled, with money still owed on the registration. */
+  owing: RosterRow[];
+  /** Enrolled while the payment is still pending. */
+  pending: RosterRow[];
+  /**
+   * Tried to register and every attempt in that division was declined, so the
+   * player is not enrolled. A declined card is its own order in Sports
+   * Connect; a family that tried again and succeeded is enrolled, not here.
+   */
+  declined: Array<RosterRow & { division: string }>;
+}
+
+/**
+ * The one reading of "unpaid", from the same collapsed rows the counts and
+ * rosters use. A cancelled registration's balance is not owed (the
+ * registration is gone), so it is never counted — on the live books those are
+ * nine cancelled line items carrying $2,379.50 of a balance nobody owes.
+ */
+export function unpaid(enrollments: Enrollment[]): Unpaid {
+  const row = (e: Enrollment) => ({ ...roster([e], e.divisionId, () => true)[0], division: e.division });
+  return {
+    owing: enrollments.filter((e) => e.state === "enrolled" && e.balance > 0).map(row),
+    pending: enrollments.filter((e) => e.state === "pending").map(row),
+    declined: enrollments.filter((e) => e.state === "failed").map(row),
+  };
 }

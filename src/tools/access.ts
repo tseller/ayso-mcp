@@ -13,7 +13,7 @@ function viewerScope() {
     .map(([name]) => name);
   return {
     viewerTools: read.length,
-    viewerCan: "read QuickBooks, Divvy and Sports Connect (balances, reports, budgets, transactions, cards, orders, refunds)",
+    viewerCan: "read QuickBooks, Divvy and Sports Connect (balances, reports, budgets, transactions, cards, orders, refunds, enrollment, volunteers, unpaid registrations, player history)",
     viewerCannot: "create, edit, classify or attach anything anywhere, or change who has access",
   };
 }
