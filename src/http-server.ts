@@ -6,24 +6,15 @@ import { McpServer, createMcpHandler, isInitializeRequest } from "@modelcontextp
 import express from "express";
 import type { QboConfig } from "./qbo-client.js";
 import { QboClient } from "./qbo-client.js";
-import { registerQboAccountTools } from "./tools/qbo-accounts.js";
-import { registerQboVendorTools } from "./tools/qbo-vendors.js";
-import { registerQboTransactionTools } from "./tools/qbo-transactions.js";
-import { registerQboReportTools } from "./tools/qbo-reports.js";
-import { registerQboReconcileTools } from "./tools/qbo-reconcile.js";
-import { registerQboClassTools } from "./tools/qbo-classes.js";
-import { registerQboClassReportTools } from "./tools/qbo-class-reports.js";
-import { registerQboClassWriteTools } from "./tools/qbo-class-writes.js";
-import { registerQboBudgetTools } from "./tools/qbo-budgets.js";
 import { createOAuthRouter, createRequireAuth } from "./oauth.js";
-import { FirestoreOAuthStore } from "./oauth-store.js";
+import { FirestoreOAuthStore, type OAuthStore } from "./oauth-store.js";
 import { createQboAuthRouter } from "./qbo-auth-callback.js";
 import { DivvyClient } from "./divvy-client.js";
-import { registerDivvyTools } from "./tools/divvy.js";
-import { registerSportsConnectTools } from "./tools/sportsconnect.js";
-import { sportsConnectClientFromEnv } from "./sportsconnect-client.js";
+import { sportsConnectClientFromEnv, type SportsConnectClient } from "./sportsconnect-client.js";
+import { AccessStore, type Caller } from "./access.js";
+import { registerAllTools, type Access } from "./tool-registry.js";
 import { IdempotencyStore } from "./idempotency.js";
-import { gmailClientFromEnv } from "./gmail-client.js";
+import { gmailClientFromEnv, type GmailClient } from "./gmail-client.js";
 import {
   LATEST_PROTOCOL_VERSION,
   SUPPORTED_PROTOCOL_VERSIONS,
@@ -50,13 +41,50 @@ function sendAnswer(res: Response, answer: PreSessionAnswer): void {
   res.status(answer.status).json(answer.body);
 }
 
+/** What the app is built from; a test passes its own, production builds from the environment. */
+export interface HttpAppDeps {
+  store?: OAuthStore;
+  qboClient?: QboClient;
+  divvy?: DivvyClient;
+  sportsConnect?: SportsConnectClient;
+  gmail?: GmailClient;
+}
+
 export function startHttpServer(qboConfig?: QboConfig): void {
+  const { app, shutdown } = buildHttpApp({
+    qboClient: qboConfig ? new QboClient(qboConfig) : undefined,
+  });
+
+  const port = parseInt(process.env.PORT || "8080", 10);
+  const httpServer = app.listen(port, "0.0.0.0", () => {
+    console.error(`[http] Listening on 0.0.0.0:${port}`);
+  });
+
+  // Graceful shutdown for Cloud Run SIGTERM
+  process.on("SIGTERM", async () => {
+    console.error("[http] SIGTERM received, shutting down...");
+    await shutdown();
+    httpServer.close();
+  });
+}
+
+/**
+ * The whole `/mcp` deployment as an Express app, not yet listening. Anything
+ * not passed in `deps` is built from the environment as it always was.
+ */
+export function buildHttpApp(deps: HttpAppDeps = {}): { app: express.Express; shutdown: () => Promise<void> } {
   const transports = new Map<string, NodeStreamableHTTPServerTransport>();
 
   // The protocol version each live session negotiated at `initialize`. This is
   // the authoritative answer to "what does this session speak" — see
   // protocol-version.ts for why the client's per-request header isn't.
   const negotiatedVersions = new Map<string, string>();
+
+  // Who opened each live legacy session, and with what access. A session's
+  // server was built for that caller, so a request on it from anyone else —
+  // or from the same person after their access changed — is refused rather
+  // than served by a server built for someone they are not.
+  const sessionCallers = new Map<string, Caller>();
 
   const serverUrl = process.env.SERVER_URL || `http://localhost:${process.env.PORT || "8080"}`;
   const googleClientId = process.env.GOOGLE_CLIENT_ID;
@@ -67,17 +95,17 @@ export function startHttpServer(qboConfig?: QboConfig): void {
   // real request rather than on cold start, so two near-simultaneous cold
   // starts don't both race the same refresh token to Intuit (which would trip
   // refresh-token-reuse detection and revoke the whole token family).
-  const qboClient = qboConfig ? new QboClient(qboConfig) : undefined;
+  const qboClient = deps.qboClient;
 
   // Firestore-backed stores shared across sessions/instances. The Firestore
   // store works off the metadata-server token, independent of the OAuth layer.
   const gcpProjectId = process.env.GCP_PROJECT_ID || "mcp-servers-487419";
-  const firestore = new FirestoreOAuthStore(gcpProjectId);
+  const firestore = deps.store ?? new FirestoreOAuthStore(gcpProjectId);
   const idempotency = new IdempotencyStore(firestore);
-  const gmail = gmailClientFromEnv();
+  const gmail = "gmail" in deps ? deps.gmail : gmailClientFromEnv();
   // One per process, like the QBO client: it holds the signed-in portal
   // session, and the modern leg builds a server per request.
-  const sportsConnect = sportsConnectClientFromEnv();
+  const sportsConnect = "sportsConnect" in deps ? deps.sportsConnect : sportsConnectClientFromEnv();
 
   /**
    * One fresh server instance with every tool on it.
@@ -87,35 +115,30 @@ export function startHttpServer(qboConfig?: QboConfig): void {
    * legacy transport and from a 2026 client through the per-request modern
    * handler, with no second registration list to keep in step.
    */
-  const buildServer = (): McpServer => {
+  const accessStore = new AccessStore(firestore);
+  const divvyToken = process.env.DIVVY_API_TOKEN;
+  const divvy = "divvy" in deps ? deps.divvy : divvyToken ? new DivvyClient(divvyToken) : undefined;
+
+  const buildServer = (access: Access): McpServer => {
     const server = new McpServer(
-      { name: "treasurer-mcp", version: "0.2.0" },
+      // A viewer's client shows this name, so the connector says what it is.
+      { name: access === "full" ? "treasurer-mcp" : "treasurer-mcp-readonly", version: "0.2.0" },
       { capabilities: { tools: {} } },
     );
-
-    if (qboClient) {
-      registerQboAccountTools(server, qboClient);
-      registerQboVendorTools(server, qboClient);
-      registerQboTransactionTools(server, qboClient, { idempotency, gmail });
-      registerQboReportTools(server, qboClient);
-      registerQboReconcileTools(server, qboClient);
-      registerQboClassTools(server, qboClient, { idempotency });
-      registerQboClassReportTools(server, qboClient);
-      registerQboClassWriteTools(server, qboClient);
-      registerQboBudgetTools(server, qboClient);
-    }
-
-    const divvyToken = process.env.DIVVY_API_TOKEN;
-    if (divvyToken) {
-      registerDivvyTools(server, new DivvyClient(divvyToken), { gmail });
-    }
-
-    if (sportsConnect) {
-      registerSportsConnectTools(server, sportsConnect);
-    }
-
+    registerAllTools(server, access, {
+      qbo: qboClient,
+      divvy,
+      sportsConnect,
+      idempotency,
+      gmail,
+      accessStore,
+    });
     return server;
   };
+
+  /** Who this request is from. With OAuth off (local runs) there is no one to narrow. */
+  const callerOf = (res: Response): Caller =>
+    (res.locals.caller as Caller | undefined) ?? { who: "local", access: "full" };
 
   /**
    * The modern leg: MCP revision 2026-07-28, served per request.
@@ -128,10 +151,20 @@ export function startHttpServer(qboConfig?: QboConfig): void {
    * folded into, one another — the arrangement the SDK's own
    * `isLegacyRequest` recipe describes for exactly this case.
    */
-  const modern = createMcpHandler(() => buildServer(), { legacy: "reject" });
-  const modernNode = toNodeHandler(modern, {
-    onerror: (error) => console.error(`[http] modern handler error: ${error.message}`),
-  });
+  //
+  // One handler per access level: the modern era has no session to carry a
+  // caller, so each request is simply served by the handler its caller's
+  // access selects, and a viewer's handler has no write tool to call.
+  const moderns = {
+    full: createMcpHandler(() => buildServer("full"), { legacy: "reject" }),
+    viewer: createMcpHandler(() => buildServer("viewer"), { legacy: "reject" }),
+  } as const;
+  const modern = moderns.full;
+  const onerror = (error: Error) => console.error(`[http] modern handler error: ${error.message}`);
+  const modernNodes = {
+    full: toNodeHandler(moderns.full, { onerror }),
+    viewer: toNodeHandler(moderns.viewer, { onerror }),
+  } as const;
 
   /** What the modern leg advertises, read from the modern leg. See discover.ts. */
   const discoverReading = cachedDiscoverReading((request) => modern.fetch(request));
@@ -181,11 +214,12 @@ export function startHttpServer(qboConfig?: QboConfig): void {
     const oauthRouter = createOAuthRouter(
       { serverUrl, googleClientId, googleClientSecret },
       oauthStore,
+      accessStore,
     );
     app.use(oauthRouter);
 
-    // Protect MCP endpoints with OAuth
-    app.use("/mcp", createRequireAuth(oauthStore));
+    // Protect MCP endpoints with OAuth, and decide each caller's access
+    app.use("/mcp", createRequireAuth(oauthStore, accessStore));
     console.error("[http] OAuth enabled (Firestore-backed)");
   } else {
     console.error("[http] OAuth disabled (no GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET)");
@@ -220,7 +254,7 @@ export function startHttpServer(qboConfig?: QboConfig): void {
       if (route.reason === "malformed-modern") {
         res.locals.refusalReason = `modern claim rejected at ${route.rung} (${route.cell})`;
       }
-      await modernNode(req, res, req.body);
+      await modernNodes[callerOf(res).access](req, res, req.body);
       return;
     }
 
@@ -310,6 +344,20 @@ export function startHttpServer(qboConfig?: QboConfig): void {
     });
   });
 
+  /** Refuse (403) a request on a session opened by a different caller or access. */
+  const sameCaller = (sessionId: string, res: Response): boolean => {
+    const opened = sessionCallers.get(sessionId);
+    const now = callerOf(res);
+    if (!opened || (opened.who === now.who && opened.access === now.access)) return true;
+    res.locals.refusalReason = `session opened by ${opened.who} (${opened.access}), used by ${now.who} (${now.access})`;
+    res.status(403).json({
+      jsonrpc: "2.0",
+      id: null,
+      error: { code: -32001, message: "This session belongs to another caller or access level; start a new one with initialize." },
+    });
+    return false;
+  };
+
   app.post("/mcp", async (req: Request, res: Response) => {
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
 
@@ -323,6 +371,7 @@ export function startHttpServer(qboConfig?: QboConfig): void {
         sendAnswer(res, answerUnknownSession(sessionId));
         return;
       }
+      if (!sameCaller(sessionId, res)) return;
       await transport.handleRequest(req, res, req.body);
       return;
     }
@@ -346,12 +395,16 @@ export function startHttpServer(qboConfig?: QboConfig): void {
       (body as { params?: { protocolVersion?: unknown } }).params?.protocolVersion,
     );
 
+    const caller = callerOf(res);
     const transport = new NodeStreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
       onsessioninitialized: (sessionId) => {
         transports.set(sessionId, transport);
         negotiatedVersions.set(sessionId, negotiated);
-        console.error(`[http] New session: ${sessionId} protocolVersion=${negotiated}`);
+        sessionCallers.set(sessionId, caller);
+        console.error(
+          `[http] New session: ${sessionId} protocolVersion=${negotiated} access=${caller.access}`,
+        );
       },
     });
 
@@ -360,13 +413,14 @@ export function startHttpServer(qboConfig?: QboConfig): void {
       if (sid) {
         transports.delete(sid);
         negotiatedVersions.delete(sid);
+        sessionCallers.delete(sid);
       }
       console.error(`[http] Session closed: ${sid}`);
     };
 
     // A fresh server for this session, from the same factory the modern leg
     // builds its per-request instances with.
-    const server = buildServer();
+    const server = buildServer(caller.access);
 
     await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
@@ -387,6 +441,7 @@ export function startHttpServer(qboConfig?: QboConfig): void {
       sendAnswer(res, answerUnknownSession(sessionId));
       return;
     }
+    if (!sameCaller(sessionId, res)) return;
     await transport.handleRequest(req, res);
   };
 
@@ -394,31 +449,25 @@ export function startHttpServer(qboConfig?: QboConfig): void {
 
   app.delete("/mcp", sessionScoped);
 
-  const port = parseInt(process.env.PORT || "8080", 10);
-
-  const httpServer = app.listen(port, "0.0.0.0", () => {
-    console.error(`[http] Listening on 0.0.0.0:${port}`);
-    // Say which eras this process actually serves, in the process's own log,
-    // by asking the modern leg rather than announcing a compiled-in constant.
-    void discoverReading().then((reading) => {
-      console.error(
-        reading.ok
-          ? `[http] Serving both MCP eras — modern: ${reading.advertisement.supportedVersions.join(", ")}` +
-              ` (server/discover); legacy: ${SUPPORTED_PROTOCOL_VERSIONS.join(", ")} (initialize, sessionful)`
-          : `[http] Modern leg did not answer its own server/discover: ${reading.error}`,
-      );
-    });
+  // Say which eras this process actually serves, in the process's own log,
+  // by asking the modern leg rather than announcing a compiled-in constant.
+  void discoverReading().then((reading) => {
+    console.error(
+      reading.ok
+        ? `[http] Serving both MCP eras — modern: ${reading.advertisement.supportedVersions.join(", ")}` +
+            ` (server/discover); legacy: ${SUPPORTED_PROTOCOL_VERSIONS.join(", ")} (initialize, sessionful)`
+        : `[http] Modern leg did not answer its own server/discover: ${reading.error}`,
+    );
   });
 
-  // Graceful shutdown for Cloud Run SIGTERM
-  process.on("SIGTERM", async () => {
-    console.error("[http] SIGTERM received, shutting down...");
+  const shutdown = async () => {
     for (const transport of transports.values()) {
       await transport.close();
     }
-    // Both legs are torn down: the modern handler aborts its in-flight
-    // per-request exchanges and closes their instances.
-    await modern.close();
-    httpServer.close();
-  });
+    // Both legs are torn down: the modern handlers abort their in-flight
+    // per-request exchanges and close their instances.
+    await Promise.all([moderns.full.close(), moderns.viewer.close()]);
+  };
+
+  return { app, shutdown };
 }
